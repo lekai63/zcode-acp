@@ -339,8 +339,11 @@ export async function buildConfigOptions(server, zcodeSid, receiverRoot) {
         thoughtOptions = [...CONFIG_META.thought.options];
     // Paseo renders the ACP session `modes` as its own Mode control and switches
     // via session/set_mode, so the category-"mode" option is redundant there and
-    // would otherwise be rendered a second time as a setting.
-    const omitMode = receiverRoot !== undefined && server.paseoConnectionRoots.has(receiverRoot);
+    // would otherwise be rendered a second time as a setting. Client-name check
+    // is process-wide (paseo runs a dedicated bridge) because later recomputes
+    // (config_option_update, dispatch) may carry no receiver root.
+    const omitMode = server.isPaseoClient() ||
+        (receiverRoot !== undefined && server.paseoConnectionRoots.has(receiverRoot));
     const options = [
         {
             id: "model",

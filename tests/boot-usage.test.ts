@@ -239,4 +239,21 @@ describe("per-connection paseo gating", () => {
     const withNone = await buildConfigOptions(server, null);
     expect(withNone.some((o) => o.id === "mode")).toBe(true);
   });
+
+  it("session/new from a paseo connection omits mode, keeps model/thought", async () => {
+    const server = new ZcodeAcpServer();
+    server.backend = fakeBackend(0);
+    const paseoRoot = { id: "paseo" };
+    await server.initialize(
+      { clientInfo: { name: "paseo" } } as acp.InitializeRequest,
+      recordingCx(paseoRoot).cx,
+    );
+    const { cx } = recordingCx(paseoRoot);
+    vi.spyOn(server.clients, "broadcast").mockReturnValue(cx);
+
+    const resp = await newSession(server, { cwd: "/tmp/proj" } as acp.NewSessionRequest, cx);
+    expect(resp.configOptions.some((o) => o.id === "mode")).toBe(false);
+    expect(resp.configOptions.some((o) => o.id === "model")).toBe(true);
+    expect(resp.configOptions.some((o) => o.id === "thought")).toBe(true);
+  });
 });

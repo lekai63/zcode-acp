@@ -643,6 +643,17 @@ export class ZcodeAcpServer {
   }
 
   /**
+   * Whether the ACP client is Paseo. Paseo surfaces the session `modes` as its
+   * own Mode control and switches via `session/set_mode`, so the bridge omits
+   * the redundant category-"mode" config option for it. Checked process-wide,
+   * not per connection: paseo spawns a dedicated bridge process per session and
+   * `clientConnectionRoot` can be undefined on later requests.
+   */
+  isPaseoClient(): boolean {
+    return (this.clientName ?? "").toLowerCase().includes("paseo");
+  }
+
+  /**
    * OR-merge capabilities from a newly connected client. Each connection runs
    * its own `initialize`; boolean capabilities are unioned across clients so a
    * feature advertised by ANY attached client (Zed or a remote one) enables the
