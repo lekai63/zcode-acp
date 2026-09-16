@@ -45,6 +45,7 @@
     "lint": "eslint .",
     "smoke": "node dist/index.js < /dev/null",
     "smoke:tui": "node dist/cli.js tui --check",
+    "prepare": "npm run build",
     "prepublishOnly": "pnpm run build && pnpm run test",
     "postinstall": "node dist/remote/hub-upgrade-notify.js 2>/dev/null || true"
   },
