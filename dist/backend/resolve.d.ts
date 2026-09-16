@@ -9,9 +9,9 @@
 /**
  * The backend subcommand and its flags, shared by every launch path.
  *
- * `ZCODE_DISALLOWED_TOOLS` is passed verbatim as the app-server's
- * `--disallowed-tools` value; unset means the flag is absent, which is the
- * backend's own default.
+ * `ZCODE_DISALLOWED_TOOLS` is merged with the default Cron* disallow list
+ * (see AUTOMATION_TOOL_DEFAULTS) and passed as the app-server's
+ * `--disallowed-tools` value; unset means only the defaults.
  */
 export declare function backendArgs(): string[];
 /** Resolve the full argv to launch `zcode app-server --stdio`. */

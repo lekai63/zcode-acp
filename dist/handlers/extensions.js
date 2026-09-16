@@ -11,13 +11,18 @@
  * check error). Only the genuine per-method differences are spelled out:
  * fork's new sid mapping, compact/goal(set)'s internal-turn lock wait, and
  * setModel rerouting through updateRuntimeModelConfig.
+ *
+ * The settings methods (setModel/setThoughtLevel/setMode/updateRuntimeModel-
+ * Config) emit the config_option_update broadcast afterwards: session settings
+ * are per-SESSION, so a switch from any attached client must refresh the
+ * others (phone ↔ CLI window). They receive the broadcast-proxy cx, whose
+ * notify already fans out to every connection.
  */
 import { emitInitialUsage } from "../config/model-cache.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
-import { buildConfigOptions, buildModes } from "../config/options.js";
+import { emitConfigOptionUpdate } from "../config/options.js";
 import { ProjectionDiffer } from "../translators/projection-differ.js";
-import { clientConnectionRoot, log, warn } from "../utils.js";
-import { sendSessionUpdate } from "./io.js";
+import { log, warn } from "../utils.js";
 import { ensureRealSession } from "./session.js";
 /** Build the zcode `target` object from ACP params (checkpoint or latest). */
 function buildCheckpointTarget(params) {
@@ -46,6 +51,14 @@ export async function fork(server, params) {
     const result = (resp.result ?? {});
     if (result.forkedSessionId) {
         server.registerSession(result.forkedSessionId, result.forkedSessionId);
+        // The fork is live in THIS backend already (session/fork created it) —
+        // mark it loaded or a first-use ensureRealSession treats it as evicted
+        // and reloads without the client MCP servers. The source session's
+        // remembered set is inherited so every later reload re-sends it (#193).
+        server.markBackendLoaded(result.forkedSessionId);
+        const srcMcp = server.sessionMcpServers.get(params.sessionId);
+        if (srcMcp)
+            server.sessionMcpServers.set(result.forkedSessionId, srcMcp);
         server.ensureBackgroundListener(result.forkedSessionId);
     }
     log(`session/fork → ${result.forkedSessionId ?? "?"}`);
@@ -138,7 +151,7 @@ export async function cancelBackgroundTask(server, params) {
     return (resp.result ?? {});
 }
 /** session/setThoughtLevel → zcode session/setThoughtLevel. */
-export async function setThoughtLevel(server, params) {
+export async function setThoughtLevel(server, params, cx) {
     const zcodeSid = await resolveSidOrThrow(server, params);
     // 3.3.0 marks thoughtLevel optional (omitting it resets to the model's
     // default). Forward it only when present so a reset call isn't rejected.
@@ -151,10 +164,14 @@ export async function setThoughtLevel(server, params) {
     if (resp.error)
         throw new Error(`setThoughtLevel failed: ${resp.error.message}`);
     log("session/setThoughtLevel → ok");
+    // Session settings are per-session, not per-connection: a switch from the
+    // phone must refresh the CLI window's dropdown (and vice versa) — emit the
+    // config_option_update to every attached client, not just the switcher.
+    await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, "thought");
     return (resp.result ?? {});
 }
 /** session/updateRuntimeModelConfig → same: runtime overlay of session model config. */
-export async function updateRuntimeModelConfig(server, params) {
+export async function updateRuntimeModelConfig(server, params, cx) {
     const zcodeSid = await resolveSidOrThrow(server, params);
     const runtimeModel = params.runtimeModel;
     if (!runtimeModel)
@@ -168,10 +185,12 @@ export async function updateRuntimeModelConfig(server, params) {
     if (resp.error)
         throw new Error(`updateRuntimeModelConfig failed: ${resp.error.message}`);
     log("session/updateRuntimeModelConfig → ok");
+    // Broadcast so the other attached clients' model context bar follows.
+    await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, "model");
     return (resp.result ?? {});
 }
 /** session/setModel → applyModelSwitch (runtime overlay, not persistence). */
-export async function setModel(server, params) {
+export async function setModel(server, params, cx) {
     const zcodeSid = await resolveSidOrThrow(server, params);
     const modelId = params.modelId;
     if (!modelId)
@@ -180,6 +199,8 @@ export async function setModel(server, params) {
     if (!ok)
         throw new Error("setModel failed (model switch rejected)");
     log(`session/setModel → ${modelId} (updateRuntimeModelConfig)`);
+    // Broadcast so the other attached clients' dropdowns follow the switch.
+    await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, "model");
     return {};
 }
 /** session/setMode → zcode session/setMode + emit config_option/current_mode updates. */
@@ -200,20 +221,13 @@ export async function setMode(server, params, cx) {
         throw new Error(`setMode failed: ${resp.error.message}`);
     log(`session/setMode → ${mode}`);
     // Re-build configOptions (settings.mode.current is now updated) and emit
-    // config_option_update + current_mode_update so the editor UI reflects it.
-    const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
-    await sendSessionUpdate(cx, acpSid, {
-        sessionUpdate: "config_option_update",
-        configOptions: options,
-    });
-    const modes = await buildModes(server, zcodeSid);
-    await sendSessionUpdate(cx, acpSid, {
-        sessionUpdate: "current_mode_update",
-        currentModeId: modes.currentModeId,
-    });
+    // config_option_update + current_mode_update to EVERY attached client, so
+    // the editor UI reflects it no matter which connection switched.
+    const { currentModeId } = await emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, "mode");
     // Record the advertised mode so the turn-completion reconciliation knows the
     // client has already been told about this value.
-    server.lastMode.set(acpSid, modes.currentModeId);
+    if (currentModeId !== undefined)
+        server.lastMode.set(acpSid, currentModeId);
     return (resp.result ?? {});
 }
 /**

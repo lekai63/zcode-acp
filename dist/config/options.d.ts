@@ -45,6 +45,21 @@ export interface ModelRef {
     modelId: string;
 }
 /**
+ * Whether a provider entry is selectable in the dropdown — i.e. the desktop
+ * app itself would run it. The desktop marks a provider "未启用" when it has
+ * no usable credentials, and the IDE dropdown must not offer those models
+ * (issue #156): a keyless builtin (API-key mode picked but no key entered) or
+ * a keyless remote custom provider can never authenticate.
+ *
+ *   - Start Plan: never selectable — it cannot authenticate without the
+ *     desktop renderer (see isStartPlanProvider).
+ *   - builtin: requires `enabled: true` AND a credential (plan token / key).
+ *   - custom: excluded on explicit `enabled: false`; otherwise must be
+ *     usable — has an apiKey, declares keys not required, or points at a
+ *     local baseURL (llama.cpp/ollama-style providers work keyless).
+ */
+export declare function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean;
+/**
  * Collect models from config.json for the dropdown.
  */
 export declare function loadAllModels(): ModelRef[];
@@ -104,15 +119,29 @@ export declare function setConfigOption(server: ZcodeAcpServer, zcodeSid: string
     currentValue: string;
 } | null>;
 /** Emit a config_option_update (+ current_mode_update for mode) after a change.
- *  Returns the rebuilt options so the caller can include them in the response.
+ *  Returns the rebuilt options (+ the advertised currentModeId for mode) so the
+ *  caller can include them in the response / mirror lastMode.
  *
- *  Every payload is ALSO broadcast to the other attached clients (the CLI
- *  window when the switch came from the phone, and vice versa) — a settings
- *  change is per-session state, not per-connection.
+ *  Every payload reaches EVERY attached client (the CLI window when the switch
+ *  came from the phone, and vice versa) — a settings change is per-session
+ *  state, not per-connection. Two shapes: a broadcast-proxy cx fans out to all
+ *  clients by itself, so the update is sent once PER SESSION ALIAS through it
+ *  (clients route by payload sessionId and drop ids they don't hold — a
+ *  client holding the conversation under another acpSid must still receive
+ *  it); a real per-connection cx sends to the initiator and then the rest via
+ *  sendSessionUpdateToOthers (which loops the aliases for the others). No
+ *  "others" leg on the proxy: it has no connectionContext to exclude anyone
+ *  by, so the leg would double-deliver.
+ *
+ *  Sends are best-effort: a dead initiator connection must not skip the
+ *  broadcast or fail the handler — the switch already succeeded backend-side.
  *
  *  For model switches, also emit a usage_update with the NEW model's context
  *  window (from config.json) so the editor's context bar refreshes immediately
  *  instead of waiting for the next turn's UsageDelta. */
-export declare function emitConfigOptionUpdate(server: ZcodeAcpServer, cx: acp.AgentContext, acpSid: string, zcodeSid: string, kind: "model" | "mode" | "thought"): Promise<acp.SessionConfigOption[]>;
+export declare function emitConfigOptionUpdate(server: ZcodeAcpServer, cx: acp.AgentContext, acpSid: string, zcodeSid: string, kind: "model" | "mode" | "thought"): Promise<{
+    options: acp.SessionConfigOption[];
+    currentModeId?: string;
+}>;
 export {};
 //# sourceMappingURL=options.d.ts.map

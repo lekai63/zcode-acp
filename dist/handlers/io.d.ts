@@ -46,6 +46,16 @@ export declare function echoUserPromptToOthers(server: ZcodeAcpServer, prompter:
     prompt: acp.PromptRequest["prompt"];
 }): void;
 /**
+ * Does this cx already reach every client by itself? The broadcast proxy
+ * (ClientRegistry.broadcast()) has no `connectionContext` — exactly the field
+ * `notifyOthers` filters on — so for a proxy source the "others" fan-out would
+ * duplicate the base send on every client. Handlers registered with the proxy
+ * (extension methods, slash interception, the prompt turn loop) must pair
+ * `sendSessionUpdate` with `sendSessionUpdateToOthers` ONLY for real
+ * per-connection contexts.
+ */
+export declare function isBroadcastSource(cx: acp.AgentContext): boolean;
+/**
  * Push a `session/update` to every OTHER attached client (the prompter's
  * connection excluded). Session settings are per-SESSION, not per-connection:
  * a model/mode switch made from the phone must reach the CLI window and vice

@@ -68,5 +68,14 @@ export declare class BackgroundTaskListener implements EventListener {
      * and clears terminalSentData so the terminal UI closes cleanly.
      */
     markCancelled(taskId: string): Promise<void>;
+    /**
+     * Terminal record for tasks still in flight when the bridge (or its backend
+     * subprocess) shuts down. The CLI runtime keeps its task registry in memory
+     * and aborts silently on adapter close — no completion/termination event is
+     * ever emitted, so the client's card would stay in_progress forever. Emit a
+     * `failed` update with `shutdown: true` metadata instead (#194). Best-effort;
+     * called from the bridge shutdown paths before the backend pipe closes.
+     */
+    emitShutdownRecords(): Promise<void>;
 }
 //# sourceMappingURL=background-tasks.d.ts.map

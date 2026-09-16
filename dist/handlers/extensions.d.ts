@@ -11,6 +11,12 @@
  * check error). Only the genuine per-method differences are spelled out:
  * fork's new sid mapping, compact/goal(set)'s internal-turn lock wait, and
  * setModel rerouting through updateRuntimeModelConfig.
+ *
+ * The settings methods (setModel/setThoughtLevel/setMode/updateRuntimeModel-
+ * Config) emit the config_option_update broadcast afterwards: session settings
+ * are per-SESSION, so a switch from any attached client must refresh the
+ * others (phone ↔ CLI window). They receive the broadcast-proxy cx, whose
+ * notify already fans out to every connection.
  */
 import type * as acp from "@agentclientprotocol/sdk";
 import type { ZcodeAcpServer } from "../server.js";
@@ -28,11 +34,11 @@ export declare function compact(server: ZcodeAcpServer, params: ExtensionParams,
 /** session/cancelBackgroundTask → zcode session/cancelBackgroundTask. */
 export declare function cancelBackgroundTask(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result>;
 /** session/setThoughtLevel → zcode session/setThoughtLevel. */
-export declare function setThoughtLevel(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result>;
+export declare function setThoughtLevel(server: ZcodeAcpServer, params: ExtensionParams, cx: acp.AgentContext): Promise<Result>;
 /** session/updateRuntimeModelConfig → same: runtime overlay of session model config. */
-export declare function updateRuntimeModelConfig(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result>;
+export declare function updateRuntimeModelConfig(server: ZcodeAcpServer, params: ExtensionParams, cx: acp.AgentContext): Promise<Result>;
 /** session/setModel → applyModelSwitch (runtime overlay, not persistence). */
-export declare function setModel(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result>;
+export declare function setModel(server: ZcodeAcpServer, params: ExtensionParams, cx: acp.AgentContext): Promise<Result>;
 /** session/setMode → zcode session/setMode + emit config_option/current_mode updates. */
 export declare function setMode(server: ZcodeAcpServer, params: ExtensionParams, cx: acp.AgentContext): Promise<Result>;
 /**

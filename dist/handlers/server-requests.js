@@ -682,8 +682,11 @@ const INTERRUPTED = Symbol("interactionInterrupted");
  * {@link ActiveInteraction}): the broadcast proxy races the clients connected
  * at fire time, and `resendPendingInteractions` can add targeted attempts at
  * clients that attach mid-wait. After the wait settles (answered OR
- * interrupted — the caller replies decline), the entry is dropped and every
- * still-open attempt is aborted, dismissing the leftover dialogs.
+ * interrupted — the caller replies decline), the entry is dropped, every
+ * still-open attempt is aborted (best-effort only — see below), and
+ * `$/zcode/ask_settled` tells the clients whose dialogs are still open to
+ * dismiss them (the SDK ignores cancellationSignal, so the abort alone never
+ * reaches the wire).
  */
 async function requestWithTimeout(server, cx, method, params, label, timeoutMs = INTERACTION_TIMEOUT_MS, turn) {
     // Each racer may register timers / listeners that outlive the race. Collect
@@ -775,8 +778,10 @@ async function requestWithTimeout(server, cx, method, params, label, timeoutMs =
         }
     }
     // The interaction is decided either way (answered, or interrupted — the
-    // caller replies decline): unregister it and dismiss dialogs still open on
-    // clients that never answered (abort → `$/cancel_request`).
+    // caller replies decline): unregister it. Aborting the losing attempts is
+    // best-effort only — the SDK's request() IGNORES cancellationSignal (no
+    // `$/cancel_request` ever reaches the wire), so the visible dismissal of
+    // the losers' stale dialogs is emitAskSettled below.
     active.delete(entry);
     if (!entry.settled) {
         entry.settled = true;
@@ -784,7 +789,41 @@ async function requestWithTimeout(server, cx, method, params, label, timeoutMs =
             ctrl.abort();
         entry.controllers.clear();
     }
+    emitAskSettled(server, method, params);
     return winner;
+}
+/**
+ * Tell every attached client that an interaction ask was decided (another
+ * client answered, or the wait broke) so a still-open copy of that dialog on
+ * another client dismisses. This is the ONLY working cross-client dismissal:
+ * the Node SDK never sends `$/cancel_request` (it ignores cancellationSignal),
+ * so the losing client's popup would otherwise hang forever — the observed
+ * "CLI keeps showing the confirmation after the phone answered" bug.
+ * Fire-and-forget; the client that answered no-ops on it. One copy per
+ * session alias (clients route by payload sessionId).
+ */
+function emitAskSettled(server, method, params) {
+    try {
+        const p = params;
+        const sessionId = typeof p.sessionId === "string" ? p.sessionId : "";
+        if (!sessionId || server.clients.size === 0)
+            return;
+        const payload = {
+            kind: method === "session/request_permission" ? "permission" : "elicitation",
+            ...(method === "session/request_permission" && typeof p.toolCall?.toolCallId === "string"
+                ? { toolCallId: p.toolCall.toolCallId }
+                : {}),
+        };
+        void Promise.all(server
+            .sessionAliases(sessionId)
+            .map((sid) => server.clients.notifyEach("$/zcode/ask_settled", () => ({ sessionId: sid, ...payload })))).catch(() => {
+            /* best-effort dismissal hint only */
+        });
+    }
+    catch {
+        // Never let the hint break the interaction flow (stub servers in tests
+        // may lack the registry entirely).
+    }
 }
 /**
  * Handle an interrupted interaction wait (connection close, env timeout, or

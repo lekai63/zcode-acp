@@ -11,7 +11,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { DEFAULT_MODEL_ID } from "../config/options.js";
+import { DEFAULT_MODEL_ID, providerSelectable } from "../config/options.js";
 import { log, ZCODE_CREDS_PATH } from "../utils.js";
 function isPlainObject(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -27,6 +27,14 @@ export function loadActiveProvider() {
         const cfg = JSON.parse(readFileSync(ZCODE_CREDS_PATH, "utf8"));
         const pinned = process.env.ZCODE_PROVIDER;
         for (const [id, p] of Object.entries(cfg.provider ?? {})) {
+            // Mirror the model dropdown's providerSelectable rule (#183): a
+            // keyless builtin provider (typical after plan upgrades in the App)
+            // would inject an empty ANTHROPIC_API_KEY and every turn fails — skip
+            // it in the default scan. Custom keyless providers stay selectable
+            // when they are local or declare apiKeyRequired:false (ollama/
+            // llama.cpp, #156). An explicit pin still honors the user's choice.
+            if (!pinned && !providerSelectable(id, p))
+                continue;
             if (p?.enabled && (!pinned || id === pinned)) {
                 const opts = p.options ?? {};
                 return {

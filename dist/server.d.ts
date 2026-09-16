@@ -111,6 +111,14 @@ export declare class ZcodeAcpServer {
      */
     readonly sessionCwds: Map<string, string>;
     /**
+     * Client-provided MCP servers per ACP session id. Like sessionCwds this
+     * survives materialization: the backend treats mcpServers as per-load
+     * runtime config, NOT persisted session state, so every later backend
+     * load/resume/reload (idle eviction, respawn, drain) must re-send them or
+     * the session silently loses its client MCP tools (#193).
+     */
+    readonly sessionMcpServers: Map<string, acp.McpServer[]>;
+    /**
      * In-flight `session/resume` single-flight, keyed by backend session id
      * (ADR-0017 first-entry race): the hub answers the App's incubation request
      * as soon as the TUI's bridge REGISTERS — before the TUI's boot-resume
@@ -427,6 +435,13 @@ export declare class ZcodeAcpServer {
      * backend's per-session listener Set.
      */
     ensureBackgroundListener(zcodeSid: string): BackgroundTaskListener;
+    /**
+     * Terminal records for in-flight background tasks before the backend
+     * subprocess is torn down — the CLI's in-memory task registry dies silently
+     * with the adapter, so without this the client's task cards hang in
+     * in_progress forever (#194). Best-effort; called from shutdown paths.
+     */
+    emitBackgroundTaskShutdownRecords(): Promise<void>;
     /** Resolve the ACP session id for a zcode session id (reverse of resolveSid). */
     resolveAcpSid(zcodeSid: string): string | undefined;
     /**
