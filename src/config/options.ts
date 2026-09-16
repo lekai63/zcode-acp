@@ -63,12 +63,27 @@ export interface ModelRef {
 }
 
 /**
+ * Start Plan (aka zcode-plan) providers are desktop-only: every model request
+ * needs an Aliyun captcha session that only the desktop renderer can provide,
+ * so a headless ACP bridge can never complete a turn with them (HTTP 1113 /
+ * signing errors — see docs/TROUBLESHOOTING.md). They are detected by provider
+ * id (`builtin:*-start-plan`) or by their zcode-plan endpoint so they never
+ * reach the model dropdown; users switch to a GLM Coding Plan provider instead.
+ */
+function isStartPlanProvider(pid: string, p: ProviderEntry | undefined): boolean {
+  if (pid.includes("start-plan")) return true;
+  return (p?.options?.baseURL ?? "").includes("/zcode-plan");
+}
+
+/**
  * Whether a provider entry is selectable in the dropdown — i.e. the desktop
  * app itself would run it. The desktop marks a provider "未启用" when it has
  * no usable credentials, and the IDE dropdown must not offer those models
  * (issue #156): a keyless builtin (API-key mode picked but no key entered) or
  * a keyless remote custom provider can never authenticate.
  *
+ *   - Start Plan: never selectable — it cannot authenticate without the
+ *     desktop renderer (see isStartPlanProvider).
  *   - builtin: requires `enabled: true` AND a credential (plan token / key).
  *   - custom: excluded on explicit `enabled: false`; otherwise must be
  *     usable — has an apiKey, declares keys not required, or points at a
@@ -76,6 +91,7 @@ export interface ModelRef {
  */
 function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean {
   if (!p) return false;
+  if (isStartPlanProvider(pid, p)) return false;
   if (isBuiltinProvider(pid)) return p.enabled === true && Boolean(p.options?.apiKey);
   if (p.enabled === false) return false;
   if (p.options?.apiKey) return true;

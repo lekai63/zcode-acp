@@ -62,6 +62,8 @@ function fakeServer(opts: { martty?: boolean } = {}) {
     marttyClientSeen: opts.martty ?? true,
     quotaDock: null as string | null,
     marttyConnectionRoots: new Set<unknown>([marttyRoot]),
+    paseoConnectionRoots: new Set<unknown>(),
+    isPaseoClient: () => false,
     sessionMap: new Map([["acp-1", "z-1"]]),
     pendingSessions: new Map([["acp-pending", {}]]),
     resolveSid: (sid: string) =>

@@ -8,6 +8,9 @@
  * parseModelValue still accepts a legacy bare modelId (first enabled builtin).
  * Dropdown labels stay the bare modelId for a single builtin; colliding
  * modelIds are qualified with the provider name.
+ *
+ * Start Plan (zcode-plan) providers are desktop-only (Aliyun captcha) and must
+ * never be advertised — neither by builtin id nor by endpoint.
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -32,9 +35,9 @@ function collidingPlansConfig() {
   return {
     provider: {
       "builtin:zai-coding-plan": codingPlan("Z.ai - Coding Plan", "https://api.z.ai/api/anthropic"),
-      "builtin:zai-start-plan": codingPlan(
-        "Z.ai - Start Plan",
-        "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+      "builtin:bigmodel-coding-plan": codingPlan(
+        "BigModel - Coding Plan",
+        "https://open.bigmodel.cn/api/anthropic",
       ),
     },
   };
@@ -80,14 +83,14 @@ describe("model configOptions uniqueness", () => {
     expect(parsed).toEqual([
       { providerId: "builtin:zai-coding-plan", modelId: "GLM-5.3" },
       { providerId: "builtin:zai-coding-plan", modelId: "GLM-5.3-Flash" },
-      { providerId: "builtin:zai-start-plan", modelId: "GLM-5.3" },
-      { providerId: "builtin:zai-start-plan", modelId: "GLM-5.3-Flash" },
+      { providerId: "builtin:bigmodel-coding-plan", modelId: "GLM-5.3" },
+      { providerId: "builtin:bigmodel-coding-plan", modelId: "GLM-5.3-Flash" },
     ]);
     expect(model?.options.map((option) => option.name)).toEqual([
       "Z.ai - Coding Plan › GLM-5.3",
       "Z.ai - Coding Plan › GLM-5.3-Flash",
-      "Z.ai - Start Plan › GLM-5.3",
-      "Z.ai - Start Plan › GLM-5.3-Flash",
+      "BigModel - Coding Plan › GLM-5.3",
+      "BigModel - Coding Plan › GLM-5.3-Flash",
     ]);
   });
 
@@ -116,5 +119,59 @@ describe("model configOptions uniqueness", () => {
       modelId: "GLM-5.3",
     });
     expect(loadAllModels()).toHaveLength(2);
+  });
+});
+
+describe("Start Plan exclusion", () => {
+  it("hides builtin Start Plan providers (id) and zcode-plan endpoints (baseURL)", async () => {
+    fakeConfig = {
+      provider: {
+        "builtin:bigmodel-coding-plan": codingPlan(
+          "BigModel - Coding Plan",
+          "https://open.bigmodel.cn/api/anthropic",
+        ),
+        "builtin:bigmodel-start-plan": codingPlan(
+          "BigModel- Coding Plan",
+          "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+        ),
+        "builtin:zai-start-plan": codingPlan(
+          "Z.ai - Coding Plan",
+          "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+        ),
+        "custom-zcode-plan-proxy": codingPlan("Plan Proxy", "https://proxy.test/v1/zcode-plan"),
+      },
+    };
+
+    const models = loadAllModels();
+    expect([...new Set(models.map((m) => m.providerId))]).toEqual(["builtin:bigmodel-coding-plan"]);
+    // Nothing with a Start Plan provider id or a zcode-plan endpoint leaks in.
+    expect(models.every((m) => !m.providerId.includes("start-plan"))).toBe(true);
+    expect(models).toHaveLength(2);
+  });
+
+  it("keeps them out of the ACP dropdown even when configured first", async () => {
+    fakeConfig = {
+      provider: {
+        "builtin:zai-start-plan": codingPlan(
+          "Z.ai - Start Plan",
+          "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+        ),
+        "builtin:zai-coding-plan": codingPlan(
+          "Z.ai - Coding Plan",
+          "https://api.z.ai/api/anthropic",
+        ),
+      },
+    };
+
+    const options = await buildConfigOptions(new ZcodeAcpServer(), null);
+    const model = options.find((option) => option.id === "model");
+    const values = model?.options.map((option) => option.value) ?? [];
+
+    expect(values).toEqual([
+      "builtin:zai-coding-plan\\GLM-5.3",
+      "builtin:zai-coding-plan\\GLM-5.3-Flash",
+    ]);
+    // The pending default follows the leading (now first) coding plan.
+    expect(model?.currentValue).toBe(formatModelValue("builtin:zai-coding-plan", "GLM-5.3"));
   });
 });
