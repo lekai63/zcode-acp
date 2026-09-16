@@ -1,0 +1,344 @@
+/**
+ * dispatchEvent — the single funnel that turns an InternalEvent into an ACP
+ * `session/update` notification.
+ *
+ * Each event kind is serialised here so the translation layers stay focused
+ * on producing the internal shape. The Bash terminal-output protocol (the
+ * 2-notification split: terminal_output + terminal_exit) is fully implemented
+ * below in dispatchTerminalUpdate.
+ */
+import { randomUUID } from "node:crypto";
+import { currentModelCached } from "../config/model-cache.js";
+import { buildConfigOptions, formatModelValue, modelContextWindow, parseModelValue, } from "../config/options.js";
+import { extractExitCode, parseSubagentMetadata, TOOL_KIND_MAP, } from "../translators/tool-helpers.js";
+import { messages } from "../i18n.js";
+import { clientConnectionRoot, warn } from "../utils.js";
+import { sendSessionUpdate, sendSessionUpdateToOthers } from "./io.js";
+/** True once the EPERM hint fired for this process — throttled to one shot. */
+let sandboxEpermHinted = false;
+/**
+ * Sandbox observability (#127): a syscall-level Seatbelt denial surfaces in
+ * the child as a bare `Operation not permitted` — no ask path (that flow is
+ * write-path only), no attribution, and tools misreport it as their own bug.
+ * When the backend runs sandboxed, tag the first EPERM-class tool output so
+ * diagnostics have a signal pointing at the sandbox instead.
+ */
+function hintSandboxEperm(server, ev) {
+    if (sandboxEpermHinted || !server.backendSandboxed || ev.kind !== "ToolCallUpdate")
+        return;
+    // Failed outputs only: successful tools routinely ECHO the phrase (cat-ing
+    // this repo's own docs, grep hits) and would false-positive the hint.
+    if (ev.status !== "failed")
+        return;
+    if (!`${ev.output ?? ""}`.includes("Operation not permitted"))
+        return;
+    sandboxEpermHinted = true;
+    warn("  ⚠ tool output contained 'Operation not permitted' with the Seatbelt sandbox armed — " +
+        "likely a sandbox denial, not a tool bug (docs/TROUBLESHOOTING.md; path grants go in " +
+        ".zcode/acp/sandbox.json)");
+}
+/** Test hook: re-arm the one-shot EPERM hint. */
+export function resetSandboxEpermHintForTest() {
+    sandboxEpermHinted = false;
+}
+/** Dispatch one internal event to the ACP client as a session/update. */
+export async function dispatchEvent(server, cx, acpSid, ev, chunkMsgId) {
+    hintSandboxEperm(server, ev);
+    // One conversation can be attached under several ACP ids (see
+    // server.sessionAliases): emit once per alias with that alias as the
+    // payload sessionId, or every client but the prompter starves silently.
+    const targets = server.sessionAliases(acpSid);
+    for (const sid of targets) {
+        switch (ev.kind) {
+            case "ToolCallNew":
+                await dispatchToolCallNew(server, cx, sid, ev);
+                break;
+            case "ToolCallUpdate":
+                await dispatchToolCallUpdate(server, cx, sid, ev);
+                break;
+            case "UsageDelta":
+                await dispatchUsageDelta(server, cx, sid, ev);
+                break;
+            case "TextDelta":
+                await sendSessionUpdate(cx, sid, {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: ev.text },
+                    messageId: ev.messageId ?? chunkMsgId,
+                });
+                break;
+            case "ReasoningDelta":
+                await sendSessionUpdate(cx, sid, {
+                    sessionUpdate: "agent_thought_chunk",
+                    content: { type: "text", text: ev.text },
+                    messageId: `thought_${ev.messageId ?? chunkMsgId}`,
+                });
+                break;
+            case "PlanUpdate":
+                await sendSessionUpdate(cx, sid, {
+                    sessionUpdate: "plan",
+                    entries: ev.entries,
+                });
+                break;
+            case "FilesChanged":
+                await dispatchFilesChanged(cx, sid, ev);
+                break;
+            case "ConfigChanged":
+                await dispatchConfigChanged(server, cx, sid, ev);
+                break;
+        }
+    }
+}
+/**
+ * Session settings changed (model/mode/thoughtLevel switch). Push the rebuilt
+ * configOptions (+ current_mode_update for mode) so the editor UI follows the
+ * switch immediately — even mid-turn, without waiting for turn completion.
+ *
+ * Builds the option structures from the session's authoritative settings
+ * (`session/read` via buildConfigOptions), then overlays the values from the
+ * event patch. A state.updated patch only carries the fields that actually
+ * changed, so building from the null defaults instead would reset every
+ * untouched field — most visibly the model dropdown jumping back to the
+ * default model mid-conversation.
+ * Best-effort: failures are logged and swallowed, never thrown into the loop.
+ */
+async function dispatchConfigChanged(server, cx, acpSid, ev) {
+    try {
+        // Fall back to null (defaults) only if the session mapping isn't live yet —
+        // events routed through a registered turn loop always have it.
+        const zcodeSid = server.resolveSid(acpSid) ?? null;
+        const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
+        // Find by id — the array order buildConfigOptions returns is not a
+        // contract; index-based writes would silently hit the wrong option if
+        // that order ever changed (emitModeViaConfigOption already does this).
+        const setById = (id, value) => {
+            const opt = options.find((o) => o.id === id);
+            if (opt)
+                opt.currentValue = value;
+        };
+        if (ev.model) {
+            setById("model", formatModelValue(ev.model.providerId, ev.model.modelId));
+        }
+        if (ev.mode !== undefined)
+            setById("mode", ev.mode);
+        if (ev.thought !== undefined)
+            setById("thought", ev.thought);
+        const configUpdate = {
+            sessionUpdate: "config_option_update",
+            configOptions: options,
+        };
+        await sendSessionUpdate(cx, acpSid, configUpdate);
+        // Settings are per-session: the CLI's /model or the phone's dropdown must
+        // reach every OTHER attached client too.
+        sendSessionUpdateToOthers(server, cx, acpSid, configUpdate);
+        if (ev.mode !== undefined) {
+            // Mirror the advertised mode so turn-completion reconciliation
+            // (emitModeIfChanged) doesn't re-emit the same value.
+            server.lastMode.set(acpSid, ev.mode);
+            const modeUpdate = {
+                sessionUpdate: "current_mode_update",
+                currentModeId: ev.mode,
+            };
+            await sendSessionUpdate(cx, acpSid, modeUpdate);
+            sendSessionUpdateToOthers(server, cx, acpSid, modeUpdate);
+        }
+    }
+    catch (e) {
+        warn(`dispatch: ConfigChanged failed (${e instanceof Error ? e.message : String(e)})`);
+    }
+}
+function dispatchToolCallNew(server, cx, acpSid, ev) {
+    const termSupported = server.supportsTerminalOutput() && (ev.tool === "Bash" || ev.tool === "bash");
+    const meta = { claudeCode: { toolName: ev.tool } };
+    if (termSupported)
+        meta["terminal_info"] = { terminal_id: ev.callId };
+    // Mark sub-agent dispatch cards so editors can badge them from creation.
+    if (ev.tool === "Agent" || ev.tool === "Task")
+        meta["subagent"] = true;
+    const update = {
+        sessionUpdate: "tool_call",
+        toolCallId: ev.callId,
+        title: ev.title,
+        kind: (TOOL_KIND_MAP[ev.tool] ?? "other"),
+        status: ev.status,
+        rawInput: ev.input,
+        _meta: meta,
+    };
+    if (termSupported) {
+        update.content = [{ type: "terminal", terminalId: ev.callId }];
+    }
+    else if (ev.diffContent && ev.diffContent.length > 0) {
+        update.content = ev.diffContent;
+    }
+    else if (ev.content && ev.content.length > 0) {
+        update.content = ev.content;
+    }
+    if (ev.locations && ev.locations.length > 0)
+        update.locations = ev.locations;
+    return sendSessionUpdate(cx, acpSid, update);
+}
+function dispatchToolCallUpdate(server, cx, acpSid, ev) {
+    const toolName = ev.tool ?? "";
+    const termSupported = server.supportsTerminalOutput() && (toolName === "Bash" || toolName === "bash");
+    if (termSupported) {
+        // Background Bash: the `result` event carries the launch acknowledgement
+        // ("Command running in background with ID: exec_…"), NOT the final output.
+        // Closing the card now (terminal_exit + status:completed) would make it
+        // indistinguishable from a normal Bash call and steal the lifecycle from
+        // the BackgroundTaskListener, which owns the real completion via
+        // out-of-band `session.updated` events. So stream any launch text via
+        // terminal_output and leave the card in_progress.
+        if (ev.background) {
+            return dispatchTerminalUpdate(server, cx, acpSid, ev, toolName, {
+                skipExit: true,
+            });
+        }
+        return dispatchTerminalUpdate(server, cx, acpSid, ev, toolName);
+    }
+    const update = {
+        sessionUpdate: "tool_call_update",
+        toolCallId: ev.callId,
+        status: ev.status,
+    };
+    const meta = {};
+    if (toolName)
+        meta["claudeCode"] = { toolName };
+    // Sub-agent (Agent/Task tool) result: surface structured metadata so editors
+    // can badge the card (agentId, background flag, token/tool/time usage). The
+    // raw result text is left in `content` for the user-facing view.
+    if ((toolName === "Agent" || toolName === "Task") &&
+        (ev.status === "completed" || ev.status === "failed")) {
+        const sub = parseSubagentMetadata(ev.rawResult);
+        if (sub)
+            meta["subagent"] = sub;
+    }
+    if (ev.output !== undefined)
+        update.rawOutput = ev.output;
+    if (ev.diffContent && ev.diffContent.length > 0) {
+        update.content = ev.diffContent;
+    }
+    else if (ev.content && ev.content.length > 0) {
+        update.content = ev.content;
+    }
+    if (Object.keys(meta).length > 0)
+        update._meta = meta;
+    if (ev.locations && ev.locations.length > 0)
+        update.locations = ev.locations;
+    return sendSessionUpdate(cx, acpSid, update);
+}
+/**
+ * Bash terminal update — the 2-notification split (matches acp-agent.ts:5061-5094
+ * and the Python bridge's _dispatch_event). Zed correlates by terminal_id, so
+ * the two notifications MUST be separate:
+ *   ① terminal_output — pure data, no status/content. Streams live output.
+ *   ② terminal_exit — terminal state only: status + content[type:terminal] +
+ *      _meta.terminal_exit (with exitCode). Sent ONLY on completed/failed.
+ *
+ * Merging them into one notification causes Zed to clear the content once the
+ * turn completes (the original bug); splitting keeps the output visible.
+ *
+ * OUTPUT DEDUP (two distinct hazards, both fixed here):
+ *  - Progress replay: zcode's `stdoutTail` is a CUMULATIVE snapshot of the tail,
+ *    but terminal_output.data is APPEND semantics. Without diffing, each progress
+ *    event replays the whole tail → N× duplication. We track the last-sent
+ *    snapshot per callId and emit only the suffix beyond it.
+ *  - Result replay: zcode's result payload re-sends the COMPLETE output. Once
+ *    progress has streamed it, emitting it again would duplicate every line.
+ *    So on completed/failed we SKIP terminal_output IF any progress already
+ *    streamed data for this callId; for short commands (scheduled → result, no
+ *    progress) nothing was sent yet, so we emit the full output once.
+ */
+async function dispatchTerminalUpdate(server, cx, acpSid, ev, toolName, opts = {}) {
+    // Extract the textual output from whichever payload field carries it.
+    let termData = ev.rawOutput ?? ev.rawResult;
+    if (termData && typeof termData === "object" && !Array.isArray(termData)) {
+        termData = termData["content"] ?? "";
+    }
+    const full = termData ? String(termData) : "";
+    const lastSent = server.terminalSentData.get(ev.callId) ?? "";
+    // ① terminal_output (pure data, append semantics).
+    //    - progress (in_progress): zcode's stdoutTail is a CUMULATIVE snapshot of
+    //      the tail, but terminal_output.data is APPEND semantics, so we diff and
+    //      emit only the suffix beyond the last-sent snapshot.
+    //    - result (completed/failed): the full output was already streamed during
+    //      progress, and zcode's result re-sends the complete tail → skip, UNLESS
+    //      no progress ever fired (short command: scheduled → result). In that
+    //      case nothing was streamed yet, so emit the full output once.
+    const isResult = ev.status === "completed" || ev.status === "failed";
+    const alreadyStreamed = server.terminalSentData.has(ev.callId);
+    if (full && !(isResult && alreadyStreamed)) {
+        const delta = lastSent && full.startsWith(lastSent) ? full.slice(lastSent.length) : full;
+        if (delta) {
+            server.terminalSentData.set(ev.callId, full);
+            await sendSessionUpdate(cx, acpSid, {
+                sessionUpdate: "tool_call_update",
+                toolCallId: ev.callId,
+                _meta: { terminal_output: { terminal_id: ev.callId, data: delta } },
+            });
+        }
+    }
+    // Background Bash launch: leave the card in_progress — BackgroundTaskListener
+    // owns the final status + terminal_exit via out-of-band session.updated. We
+    // MUST still seed terminalSentData with an empty entry (even when no launch
+    // text was streamed) so the listener can recognise this callId as a tracked
+    // launch card and route its updates back to the same card.
+    if (opts.skipExit) {
+        if (!server.terminalSentData.has(ev.callId)) {
+            server.terminalSentData.set(ev.callId, "");
+        }
+        return;
+    }
+    // ② terminal_exit (terminal state) — only on completed/failed.
+    //    Deliberately omits rawOutput: the output was already streamed via
+    //    terminal_output.data above, and Zed renders BOTH the terminal buffer and
+    //    the rawOutput fallback — including rawOutput here duplicates every line.
+    if (isResult) {
+        const exitCode = extractExitCode(ev.rawResult, ev.status === "failed");
+        const exitUpdate = {
+            sessionUpdate: "tool_call_update",
+            toolCallId: ev.callId,
+            status: ev.status,
+            content: [{ type: "terminal", terminalId: ev.callId }],
+            _meta: {
+                claudeCode: { toolName },
+                terminal_exit: { terminal_id: ev.callId, exit_code: exitCode, signal: null },
+            },
+        };
+        await sendSessionUpdate(cx, acpSid, exitUpdate);
+        // Terminal session ended — clear the snapshot so a future tool reusing this
+        // callId (shouldn't happen, but defensively) starts fresh.
+        server.terminalSentData.delete(ev.callId);
+    }
+}
+async function dispatchUsageDelta(server, cx, acpSid, ev) {
+    // The backend often returns contextWindow=0; fill from the model's
+    // config.json limit.context so the editor can render the context bar.
+    let size = ev.size;
+    if (!size) {
+        // Resolve to the real backend session id — `acpSid` may be a lazy
+        // session/new placeholder that the backend rejects with "Session is not
+        // active", wasting a 5s request timeout on every usage_update.
+        const zcodeSid = server.resolveSid(acpSid) ?? acpSid;
+        const { providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid));
+        size = modelContextWindow(providerId, modelId);
+    }
+    await sendSessionUpdate(cx, acpSid, {
+        sessionUpdate: "usage_update",
+        used: ev.used,
+        size,
+    });
+}
+function dispatchFilesChanged(cx, acpSid, ev) {
+    const files = ev.files;
+    const preview = files.slice(0, 3).join(", ");
+    const ellipsis = files.length > 3 ? "..." : "";
+    const m = messages();
+    return sendSessionUpdate(cx, acpSid, {
+        sessionUpdate: "tool_call",
+        toolCallId: `files_${randomUUID().slice(0, 8)}`,
+        title: m.changedFilesTitle(files.length, preview) + ellipsis,
+        kind: "edit",
+        status: "completed",
+        content: [{ type: "content", content: { type: "text", text: m.affectedFilesList(files) } }],
+    });
+}
+//# sourceMappingURL=dispatch.js.map

@@ -1,0 +1,69 @@
+/**
+ * Auto-compact: when the session's context-window usage exceeds a threshold,
+ * automatically invoke `session/compact` so the next prompt has room.
+ *
+ * Configured via `ZCODE_ACP_AUTO_COMPACT_THRESHOLD` (absolute token count;
+ * 0/unset = disabled). The compaction target is decided by the zcode backend
+ * — we only control *when* to trigger.
+ *
+ * Triggered from `prompt()` after a successful `end_turn`, before the response
+ * returns. Failures are best-effort (logged, never thrown) so they never break
+ * the prompt response.
+ */
+import { randomUUID } from "node:crypto";
+import { compact } from "../handlers/extensions.js";
+import { messages } from "../i18n.js";
+import { log, warn } from "../utils.js";
+import { sendTextChunk } from "../handlers/io.js";
+/** ENV: `ZCODE_ACP_AUTO_COMPACT_THRESHOLD` — absolute token count (0 = disabled). */
+export function autoCompactThreshold() {
+    const raw = Number(process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD ?? "0");
+    return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+/**
+ * If the threshold is configured and the session's current context usage meets
+ * or exceeds it, invoke `compact()`. No-op when the threshold is unset/zero,
+ * when usage is below the threshold, or on any error (best-effort).
+ */
+export async function maybeAutoCompact(server, cx, acpSid, zcodeSid) {
+    const threshold = autoCompactThreshold();
+    if (threshold <= 0)
+        return; // disabled
+    const msgId = randomUUID();
+    try {
+        // Read current context usage via session/read.
+        let used = 0;
+        try {
+            const backend = server.ensureBackend();
+            const resp = await backend.request(server.nextId(), "session/read", { sessionId: zcodeSid }, 5000);
+            if (resp.error)
+                return;
+            const result = (resp.result ?? {});
+            used = result.projection?.contextUsed ?? 0;
+        }
+        catch (e) {
+            warn(`auto-compact: session/read failed (${e instanceof Error ? e.message : String(e)})`);
+            return;
+        }
+        if (used < threshold)
+            return;
+        log(`auto-compact: contextUsed=${used} >= threshold=${threshold}, compacting…`);
+        const m = messages();
+        await sendTextChunk(cx, acpSid, m.autoCompactStart(used.toLocaleString(), threshold.toLocaleString()), msgId);
+        // compact() handles: session/compact → waitForTurnIdle → emitInitialUsage.
+        const result = (await compact(server, { sessionId: acpSid }, cx));
+        if (result.__lockTimeout) {
+            await sendTextChunk(cx, acpSid, m.autoCompactTimeout, msgId);
+        }
+        else {
+            await sendTextChunk(cx, acpSid, m.autoCompactDone, msgId);
+        }
+        log("auto-compact: done");
+    }
+    catch (e) {
+        warn(`auto-compact: compact failed (${e instanceof Error ? e.message : String(e)})`);
+        await sendTextChunk(cx, acpSid, messages().autoCompactFailed(e instanceof Error ? e.message : String(e)), msgId);
+        // Best-effort: never break the prompt response.
+    }
+}
+//# sourceMappingURL=auto-compact.js.map

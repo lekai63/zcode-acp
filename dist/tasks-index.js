@@ -1,0 +1,356 @@
+/**
+ * ZCode App tasks-index sync: let the App UI see ACP-created sessions.
+ *
+ * The ZCode App's session list reads from `~/.zcode/v2/tasks-index.sqlite`
+ * (the `tasks` table), NOT from the CLI's `~/.zcode/cli/db/db.sqlite`. These
+ * are independent stores — the App's Electron host maintains tasks-index; the
+ * headless app-server (which we drive) writes only to cli/db. As a result,
+ * every session created via ACP is invisible in the App's UI until the App
+ * happens to reindex.
+ *
+ * This module bridges that gap by writing a tasks-index row directly after
+ * session/create. The App picks it up on its next list refresh. INSERT OR
+ * IGNORE avoids clobbering rows the App already manages.
+ *
+ * Best-effort side-channel: failures (locked DB, schema drift) are logged and
+ * swallowed so they never break the session/create path.
+ */
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { DEFAULT_MODEL_ID } from "./config/options.js";
+import { warn, zcodeHomeDir, ZCODE_CREDS_PATH } from "./utils.js";
+/**
+ * Dynamically load `node:sqlite` (Node ≥ 22). On older Node the import fails;
+ * callers degrade gracefully (tasks-index sync is best-effort). We cache the
+ * loaded class so repeated calls don't re-import.
+ */
+let DatabaseSync;
+async function loadSqlite() {
+    if (DatabaseSync !== undefined)
+        return DatabaseSync;
+    try {
+        // node:sqlite ships with Node ≥ 22 (experimental on 22.x — may need
+        // --experimental-sqlite on some builds; the catch below covers that).
+        const mod = (await import("node:sqlite"));
+        DatabaseSync = mod.DatabaseSync;
+    }
+    catch {
+        DatabaseSync = null; // Node < 22, sqlite unavailable, or flag missing
+    }
+    return DatabaseSync;
+}
+/** tasks-index.sqlite sits next to config.json under ~/.zcode/v2/. */
+const TASKS_INDEX_PATH = path.join(path.dirname(ZCODE_CREDS_PATH), "tasks-index.sqlite");
+/**
+ * Detect a SQLite "database is locked" / "busy" error. node:sqlite surfaces
+ * SQLITE_BUSY (code 5) and SQLITE_LOCKED (code 6) as an Error whose message is
+ * SQLite's standard phrase — verified against a real node:sqlite v22 throw:
+ *   `Error: database is locked`, code `ERR_SQLITE_ERROR`.
+ * We match the full phrase rather than the bare word "busy" / "locked" so a
+ * filesystem path that happens to contain those words (e.g. `/Users/busy_bee/`)
+ * inside a different error message can't trigger a false-positive retry.
+ */
+function isBusyError(e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return /database is (busy|locked)/i.test(msg);
+}
+/** Promise-based sleep (best-effort retry backoff). */
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+/**
+ * Open a connection to tasks-index.sqlite and run `fn` against it, retrying on
+ * SQLITE_BUSY contention from the App's Electron host. Two short backoffs
+ * (200ms, 400ms) give the App's transaction time to commit. The connection is
+ * always closed in `finally` so a thrown error never leaks a handle.
+ *
+ * Returns whatever `fn` returns, or `null` when node:sqlite is unavailable.
+ * Rethrows non-busy errors (or busy errors that exhausted retries) so the
+ * caller can classify and log them consistently.
+ */
+async function withSqliteRetry(fn, dbPath = TASKS_INDEX_PATH) {
+    const Sqlite = await loadSqlite();
+    if (!Sqlite)
+        return null; // node:sqlite unavailable (Node < 22)
+    for (let attempt = 0; attempt < 3; attempt++) {
+        // `con` is declared outside try so the finally can close it even when the
+        // constructor itself throws (SQLITE_BUSY can surface at open time).
+        let con = null;
+        try {
+            con = new Sqlite(dbPath, { timeout: 5000 });
+            return fn(con);
+        }
+        catch (e) {
+            // Retry only on transient busy/locked; surface everything else.
+            if (attempt < 2 && isBusyError(e)) {
+                await sleep(200 * (attempt + 1)); // 200ms, 400ms
+                continue;
+            }
+            throw e;
+        }
+        finally {
+            con?.close();
+        }
+    }
+    // Unreachable — the loop either returns or throws — but satisfies TS.
+    throw new Error("withSqliteRetry: exhausted retries without resolution");
+}
+/**
+ * Read provider id + model ref from config.json.
+ *
+ * The App stores `model` as the full `providerKey/modelId` path (e.g.
+ * `builtin:bigmodel-coding-plan/GLM-5.3`) — the provider map's KEY is the
+ * provider id, not the short label. We mirror that format so App-side
+ * filtering/grouping by model treats bridge-created rows identically.
+ *
+ * `providerId` stays the short label (`glm`) — that's what every row uses
+ * regardless of source.
+ */
+function resolveProviderModel() {
+    try {
+        const cfg = JSON.parse(readFileSync(ZCODE_CREDS_PATH, "utf8"));
+        for (const [providerKey, p] of Object.entries(cfg.provider ?? {})) {
+            if (p?.enabled) {
+                const models = p.models ?? {};
+                const modelId = Object.keys(models)[0] ?? DEFAULT_MODEL_ID;
+                return { providerId: "glm", modelRef: `${providerKey}/${modelId}` };
+            }
+        }
+    }
+    catch {
+        // fall through to defaults
+    }
+    return { providerId: "glm", modelRef: DEFAULT_MODEL_ID };
+}
+/**
+ * Insert (or refresh) a row in tasks-index.sqlite so the App UI shows it.
+ * Called after a successful session/create. Uses INSERT OR IGNORE so it never
+ * overwrites a row the App is actively managing (e.g. user-renamed titles).
+ *
+ * Returns true if written, false on failure (logged, never thrown).
+ */
+export async function upsertSessionTask(opts) {
+    if (!existsSync(TASKS_INDEX_PATH))
+        return false; // App never installed → no index.
+    const nowMs = Date.now();
+    const { providerId, modelRef } = resolveProviderModel();
+    const model = opts.model ?? modelRef;
+    const status = opts.status ?? "completed";
+    const meta = {
+        taskId: opts.taskId,
+        traceId: opts.traceId ?? opts.taskId,
+        title: opts.title,
+        titleOverridden: false,
+        workspacePath: opts.workspaceKey,
+        createdAt: nowMs,
+        updatedAt: nowMs,
+        mode: "build",
+        model,
+        provider: providerId,
+        status,
+        target: null,
+    };
+    let metaJson;
+    try {
+        metaJson = JSON.stringify(meta);
+    }
+    catch {
+        return false;
+    }
+    // withSqliteRetry handles SQLITE_BUSY contention with the App's Electron
+    // host. Visible failure: a missing App-UI row is user-perceivable, so warn()
+    // (stderr, always emitted) rather than the quiet log() default.
+    try {
+        const result = await withSqliteRetry((con) => {
+            con
+                .prepare("INSERT OR IGNORE INTO tasks " +
+                "(workspace_key, workspace_path, workspace_identity, task_id, " +
+                " title, task_status, provider, mode, model, " +
+                " created_at, updated_at, unread_at, pinned, archived, deleted, " +
+                " title_overridden, meta_json, searchable_text) " +
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, 'build', ?, ?, ?, NULL, 0, 0, 0, 0, ?, ?)")
+                .run(opts.workspaceKey, opts.workspaceKey, opts.taskId, opts.title, status, providerId, model, nowMs, nowMs, metaJson, opts.title);
+            return true;
+        });
+        return result ?? false;
+    }
+    catch (e) {
+        warn(`tasks-index sync skipped: ${e instanceof Error ? e.message : String(e)}`);
+        return false;
+    }
+}
+/**
+ * User-driven rename (remote rename endpoint): pins the title with
+ * title_overridden=1 — the same marker the App's own rename flow sets — so no
+ * later automatic write can touch it. Best-effort: returns false when the row
+ * is missing or the index is unavailable.
+ */
+export async function renameSessionTask(taskId, title) {
+    if (!existsSync(TASKS_INDEX_PATH))
+        return false;
+    const trimmed = title.trim().slice(0, 80);
+    if (!trimmed)
+        return false;
+    try {
+        const result = await withSqliteRetry((con) => {
+            const row = con.prepare("SELECT meta_json FROM tasks WHERE task_id=?").get(taskId);
+            if (!row)
+                return false;
+            let metaJson;
+            try {
+                const meta = JSON.parse(row.meta_json ?? "{}");
+                meta["title"] = trimmed;
+                metaJson = JSON.stringify(meta);
+            }
+            catch {
+                // meta_json corrupt/unparseable — the App will fall back to the title
+                // column anyway, so keep the stored bytes rather than guessing.
+                metaJson = row.meta_json ?? "{}";
+            }
+            con
+                .prepare("UPDATE tasks SET title=?, title_overridden=1, updated_at=?, meta_json=? WHERE task_id=?")
+                .run(trimmed, Date.now(), metaJson, taskId);
+            return true;
+        });
+        return result ?? false;
+    }
+    catch (e) {
+        warn(`tasks-index rename skipped: ${e instanceof Error ? e.message : String(e)}`);
+        return false;
+    }
+}
+/**
+ * Update a session's title + searchable_text after the first turn.
+ *
+ * session/create leaves title empty; once the first prompt completes, set a
+ * meaningful title. Respects title_overridden: if the user already renamed in
+ * the App, their title wins (but searchable_text is still refreshed — it's not
+ * user-controlled).
+ *
+ * `searchableText` feeds the App's full-text search (the App builds it via
+ * `buildSearchableTextFromMessages`: each message's content trimmed + joined
+ * by newlines, capped at 200k chars). We pass the first user prompt here; the
+ * App later overwrites it with the full conversation when it reindexes, but
+ * having it non-empty from the start means the row shows up in search and
+ * matches the shape of App-created rows.
+ */
+export async function updateSessionTitle(taskId, title, searchableText) {
+    if (!existsSync(TASKS_INDEX_PATH) || !title)
+        return false;
+    const trimmed = title.trim().slice(0, 80);
+    if (!trimmed)
+        return false;
+    // Cap searchable_text at the App's limit (aD = 2e5 = 200000 chars).
+    const search = (searchableText ?? trimmed).trim().slice(0, 200_000);
+    // Title updates also write to tasks-index.sqlite and are equally exposed to
+    // SQLITE_BUSY contention with the App's Electron host — go through the same
+    // withSqliteRetry path as upsertSessionTask for consistent retry behaviour.
+    try {
+        const result = await withSqliteRetry((con) => {
+            const row = con
+                .prepare("SELECT title_overridden, meta_json FROM tasks WHERE task_id=?")
+                .get(taskId);
+            if (!row)
+                return false;
+            if (row.title_overridden === 1) {
+                // User renamed manually → the displayed title (title column AND
+                // meta_json.title — the App may read either) must stay untouched;
+                // only refresh searchable_text so search stays useful.
+                con
+                    .prepare("UPDATE tasks SET updated_at=?, searchable_text=? WHERE task_id=?")
+                    .run(Date.now(), search, taskId);
+                return true;
+            }
+            // The ZCode App reads title from meta_json first (falling back to the
+            // title column only when meta_json fails to parse). If we update only the
+            // column, the App keeps showing the stale meta_json title (empty at create
+            // time). So patch meta_json.title as well.
+            let metaJson;
+            try {
+                const meta = JSON.parse(row.meta_json ?? "{}");
+                meta["title"] = trimmed;
+                metaJson = JSON.stringify(meta);
+            }
+            catch {
+                // meta_json corrupt/unparseable — the App will fall back to the title
+                // column anyway, so skip the meta_json write rather than guessing.
+                metaJson = row.meta_json ?? "{}";
+            }
+            con
+                .prepare("UPDATE tasks SET title=?, updated_at=?, searchable_text=?, meta_json=? " +
+                "WHERE task_id=? AND title_overridden=0")
+                .run(trimmed, Date.now(), search, metaJson, taskId);
+            return true;
+        });
+        return result ?? false;
+    }
+    catch (e) {
+        warn(`tasks-index title update skipped: ${e instanceof Error ? e.message : String(e)}`);
+        return false;
+    }
+}
+/**
+ * Whether a recorded workspace path may be offered for remote session
+ * creation. Excludes: degenerate roots, system temp trees (macOS /tmp is a
+ * symlink to /private/tmp — both spellings; $TMPDIR lives under /var/folders),
+ * and the ZCode data root itself (the config home, not a project). The
+ * directory must still exist — a moved/deleted project disappears from the
+ * list.
+ */
+export function isSelectableWorkspace(p) {
+    if (!p || p === "/")
+        return false;
+    const excluded = ["/tmp", "/private/tmp", "/var/folders", tmpdir(), zcodeHomeDir()];
+    for (const ex of excluded) {
+        if (p === ex || p.startsWith(ex + path.sep))
+            return false;
+    }
+    try {
+        return statSync(p).isDirectory();
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Every project workspace the tasks index has ever recorded a session for —
+ * the machine's known-projects list. Serves the hub's remote session-create
+ * API: the list gates which projects POST /api/instances accepts. A
+ * convenience bound, not a security boundary — bridge-side session
+ * materialization writes rows too, and a token holder can drive an
+ * editor-bridge session in any cwd (the real boundary is the token).
+ *
+ * Read-only and best-effort: node:sqlite unavailable → empty list; lock
+ * contention retries via withSqliteRetry; other failures warn and return
+ * empty. `dbPath` defaults to the App's index (tests inject a fixture).
+ */
+export async function listKnownWorkspaces(dbPath = TASKS_INDEX_PATH) {
+    if (!existsSync(dbPath))
+        return [];
+    try {
+        const rows = await withSqliteRetry((con) => con
+            .prepare("SELECT workspace_path AS p, COUNT(*) AS n, MAX(updated_at) AS t " +
+            "FROM tasks WHERE deleted=0 GROUP BY workspace_key ORDER BY t DESC")
+            .all(), dbPath);
+        if (!rows)
+            return []; // node:sqlite unavailable (Node < 22)
+        const out = [];
+        for (const r of rows) {
+            const p = typeof r.p === "string" ? r.p : "";
+            if (!isSelectableWorkspace(p))
+                continue;
+            out.push({
+                workspacePath: p,
+                sessions: typeof r.n === "number" ? r.n : 0,
+                lastActive: typeof r.t === "number" ? r.t : 0,
+            });
+        }
+        return out;
+    }
+    catch (e) {
+        warn(`tasks-index workspace list failed: ${e instanceof Error ? e.message : String(e)}`);
+        return [];
+    }
+}
+//# sourceMappingURL=tasks-index.js.map

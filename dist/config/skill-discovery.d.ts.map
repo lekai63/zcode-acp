@@ -1,0 +1,1 @@
+{"version":3,"file":"skill-discovery.d.ts","sourceRoot":"","sources":["../../src/config/skill-discovery.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;;;;;;;;;GAoBG;AAeH,qEAAqE;AACrE,MAAM,WAAW,UAAU;IACzB,IAAI,EAAE,MAAM,CAAC;IACb,WAAW,EAAE,MAAM,CAAC;IACpB,KAAK,CAAC,EAAE;QAAE,IAAI,EAAE,MAAM,CAAA;KAAE,CAAC;CAC1B;AA0GD;;;;;GAKG;AACH,wBAAgB,iBAAiB,IAAI,UAAU,EAAE,CAyDhD"}

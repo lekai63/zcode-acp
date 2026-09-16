@@ -1,0 +1,857 @@
+/**
+ * Handle zcode-initiated server→client requests during a turn.
+ *
+ * ZCode's interaction broker dispatches three request kinds, all bridged onto
+ * ACP `session/requestPermission` (Zed supports it natively; elicitation is
+ * not supported):
+ *   - interaction/requestPermission (tool auth)       → direct option mapping
+ *   - interaction/requestUserInput (ExitPlanMode)     → approve/reject options
+ *   - interaction/requestUserInput (AskUserQuestion)  → per-question popups
+ *     (single-select: one popup; multi-select: per-option Include/Skip)
+ *
+ * Reannounce dedup: ZCode reannounces unanswered requests every ~1s sharing
+ * the same requestId/toolCallId. The first request forwards to the client;
+ * reannounces either get the cached result (if it arrived) or just record
+ * their zcode id for a later unified reply.
+ *
+ * Reconnect resend: a client-side request fired while a remote client was
+ * offline never reaches it. Undecided waits are tracked (ActiveInteraction)
+ * and re-sent to a client when its session/load / session/resume completes —
+ * the re-send joins the existing first-response-wins race.
+ */
+import { acpPermissionResponseToExitPlanMode, acpPermissionResponseToZcode, buildAskUserAcpParams, buildAskUserElicitationForm, buildPlanApprovalElicitationForm, exitPlanModeToAcpPermission, isAskUserQuestion, isExitPlanMode, isPermissionRequest, parseAskUserElicitationResponse, parseAskUserResponse, parsePlanApprovalElicitationResponse, splitAskUserQuestions, zcodePermissionToAcp, } from "../interaction/adapter.js";
+import { buildConfigOptions, buildModes } from "../config/options.js";
+import { messages } from "../i18n.js";
+import { clientConnectionRoot, log, warn } from "../utils.js";
+import { sendSessionUpdate } from "./io.js";
+function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+/**
+ * Re-read the authoritative session mode and push a `config_option_update`
+ * with the mode item's currentValue set to it.
+ *
+ * Used for ExitPlanMode reconciliation: Zed's `config_state()` drops
+ * `session_modes` to None whenever `session/new` returns configOptions (which
+ * the bridge always sends), so subsequent `current_mode_update` notifications
+ * are silently ignored — only `config_option_update` drives the dropdown.
+ *
+ * Always emits (no dedup): when the user manually switched to plan via the
+ * dropdown (session/set_mode), `lastMode` can lag the real mode and a dedup
+ * check would wrongly suppress the post-exit update.
+ */
+async function emitModeViaConfigOption(server, cx, acpSid, zcodeSid) {
+    try {
+        const modes = await buildModes(server, zcodeSid);
+        server.lastMode.set(acpSid, modes.currentModeId);
+        const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
+        const modeOpt = options.find((o) => o.id === "mode");
+        if (modeOpt)
+            modeOpt.currentValue = modes.currentModeId;
+        await sendSessionUpdate(cx, acpSid, {
+            sessionUpdate: "config_option_update",
+            configOptions: options,
+        });
+    }
+    catch (e) {
+        warn(`emitModeViaConfigOption failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+}
+/** Per-server reannounce dedup state (lazy-initialised). */
+export function getPendingInteractions(server) {
+    const existing = server
+        ._pendingInteractions;
+    if (existing)
+        return existing;
+    const fresh = new Map();
+    server._pendingInteractions =
+        fresh;
+    return fresh;
+}
+/** Per-server active interaction registry (lazy-initialised). */
+function getActiveInteractions(server) {
+    const holder = server;
+    if (holder._activeInteractions)
+        return holder._activeInteractions;
+    const fresh = new Set();
+    holder._activeInteractions = fresh;
+    return fresh;
+}
+/** Create the unresolved race entry for one interaction wait. */
+function createActiveInteraction(method, params, label) {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return {
+        method,
+        params,
+        label,
+        controllers: new Set(),
+        settled: false,
+        inFlight: 0,
+        firstError: undefined,
+        promise,
+        resolve,
+        reject,
+    };
+}
+/**
+ * Fire one attempt of an interaction race. The first attempt goes through the
+ * broadcast proxy (itself a first-response-wins race across the currently
+ * connected clients); later attempts are targeted re-sends at clients that
+ * attached mid-wait. The first attempt to answer resolves the race and aborts
+ * every other attempt's controller; when all in-flight attempts fail instead,
+ * the race rejects with the first error (surfaces like a single-client failure).
+ */
+function fireInteractionAttempt(entry, send) {
+    const ctrl = new AbortController();
+    entry.controllers.add(ctrl);
+    entry.inFlight++;
+    // send() may throw synchronously (broken/just-closed connection); funnel
+    // that into the rejection path — the reconnect re-send calls this from a
+    // timer callback, where a sync throw would crash the bridge.
+    let attempt;
+    try {
+        attempt = send({ cancellationSignal: ctrl.signal });
+    }
+    catch (err) {
+        attempt = Promise.reject(err);
+    }
+    attempt.then((value) => {
+        entry.inFlight--;
+        entry.controllers.delete(ctrl);
+        if (entry.settled)
+            return;
+        entry.settled = true;
+        for (const other of entry.controllers)
+            other.abort();
+        entry.controllers.clear();
+        entry.resolve(value);
+    }, (err) => {
+        entry.inFlight--;
+        entry.controllers.delete(ctrl);
+        if (entry.firstError === undefined)
+            entry.firstError = err;
+        if (!entry.settled && entry.inFlight === 0) {
+            entry.settled = true;
+            entry.reject(entry.firstError);
+        }
+    });
+}
+/**
+ * Delay before a reconnect re-send fires. The resend is triggered by the
+ * client's session/load / session/resume completing; the pause lets that
+ * response plus the replay updates land first, so the popup renders on a
+ * settled session view instead of racing the replay (clients commonly reset
+ * dialog state when a load starts).
+ */
+const RESEND_DELAY_MS = 300;
+/**
+ * Re-send this session's still-undecided interaction requests to a client that
+ * just (re)connected, so an agent question that fired while the client was
+ * offline becomes answerable there. Fire-and-forget, best-effort: each re-send
+ * joins the existing first-response-wins race; if another client answers first,
+ * the re-send is cancelled and the reconnected client's dialog (if any) drops.
+ */
+export function resendPendingInteractions(server, client, acpSid) {
+    const active = getActiveInteractions(server);
+    if (active.size === 0)
+        return;
+    for (const entry of [...active]) {
+        if (entry.settled)
+            continue;
+        const sid = entry.params.sessionId;
+        if (sid !== acpSid)
+            continue;
+        log(`  ⟳ ${entry.label} still unanswered, re-sending to reconnected client (sid=${acpSid})`);
+        const timer = setTimeout(() => {
+            if (entry.settled)
+                return;
+            fireInteractionAttempt(entry, (options) => client.request(entry.method, entry.params, options));
+        }, RESEND_DELAY_MS);
+        timer.unref?.();
+    }
+}
+/**
+ * Drain and handle pending zcode server→client requests for THIS session only.
+ * Returns true if any were handled (used by the turn loop to refresh the
+ * no-progress timer).
+ *
+ * The backend's `serverRequests` queue is shared across all sessions (a single
+ * subprocess serves them all). Without filtering, session A's turn loop could
+ * pop session B's permission request and forward it to A's client — the popup
+ * lands in the wrong session. When `turn` is available we filter by
+ * `params.sessionId` so each turn loop only consumes its own requests; others
+ * are re-queued for their owner. Without `turn` (tests / non-turn callers) we
+ * process everything (legacy behaviour).
+ */
+export async function handleServerRequests(server, backend, cx, acpSid, turn) {
+    const pending = getPendingInteractions(server);
+    let handled = false;
+    const mySid = turn?.zcodeSid;
+    for (;;) {
+        // Turn cancelled: drain + decline this session's requests directly instead
+        // of forwarding each to the editor (which races a 100ms cancel-poll). The
+        // backend can keep re-emitting permission/elicitation requests after a stop
+        // while it finalises; forwarding them creates a tight
+        // forward→cancel-abort→decline→re-emit loop that starves the event loop
+        // and freezes the UI (observed ~2/s sustained, accelerating until hang).
+        // Declining inline breaks the cycle: the backend gets an immediate answer
+        // per request and stops re-emitting once its stop finalisation completes.
+        // Non-busy errors and multi-attempt transient retries are unaffected —
+        // those exit the turn loop before re-entering here.
+        if (mySid !== undefined && turn?.cancelled) {
+            let declined = false;
+            const drained = backend.pollServerRequests();
+            for (const req of drained) {
+                const sid = req.params.sessionId;
+                if (sid === undefined || sid === mySid) {
+                    // The captcha-session request must keep its result shape even when
+                    // cancelled, or the backend's response validation rejects it.
+                    sendZcodeReply(backend, req.id, isProviderRuntimeHeadersRequest(req.method)
+                        ? { headersApplied: false, errorMessage: "turn cancelled" }
+                        : { action: "decline", reason: "turn cancelled" });
+                    declined = true;
+                }
+                else {
+                    backend.requeueServerRequests([req]); // not ours — leave for owner
+                }
+            }
+            return handled || declined;
+        }
+        const all = backend.pollServerRequests();
+        if (all.length === 0)
+            return handled;
+        // Without a session filter (no turn), process everything — legacy path.
+        if (mySid === undefined) {
+            for (const req of all) {
+                handled = true;
+                await handleOne(server, backend, cx, acpSid, req, pending, turn);
+            }
+            continue;
+        }
+        // Pick the first request belonging to this session; put the rest back.
+        // Requests without a sessionId field are unrouteable — claim them here
+        // so they don't sit in the queue forever.
+        let mine;
+        const others = [];
+        for (const r of all) {
+            const sid = r.params.sessionId;
+            if (!mine && (sid === undefined || sid === mySid)) {
+                mine = r;
+            }
+            else {
+                others.push(r);
+            }
+        }
+        // Re-queue the ones that don't belong to this session (prepend to preserve order).
+        if (others.length > 0)
+            backend.requeueServerRequests(others);
+        if (!mine)
+            return handled;
+        handled = true;
+        await handleOne(server, backend, cx, acpSid, mine, pending, turn);
+    }
+}
+async function handleOne(server, backend, cx, acpSid, req, pending, turn) {
+    const method = req.method;
+    const zcodeReqId = req.id;
+    const params = req.params;
+    const ask = isAskUserQuestion(method, params);
+    const perm = isPermissionRequest(method);
+    const epm = isExitPlanMode(params);
+    // Start Plan providers (zcode-plan endpoints) ask their host to solve an
+    // Aliyun captcha and inject X-Aliyun-Captcha-Verify-* headers before every
+    // model request; the desktop renderer does this from a browser environment.
+    // The headless bridge has neither a browser nor the captcha credential, so
+    // the only honest answer is headersApplied:false — the backend then fails
+    // with its -32031 error carrying our message. Without this, the request
+    // fell through to the generic unsupported-request error and the backend
+    // fell back to client signing with the provider's OAuth JWT, dying with the
+    // misleading "must contain one separator" invalid-config error (#123).
+    if (isProviderRuntimeHeadersRequest(method)) {
+        warn("  ⚠ provider runtime headers requested (Start Plan captcha session); " +
+            "the headless bridge cannot provide it — declining");
+        sendZcodeReply(backend, zcodeReqId, {
+            headersApplied: false,
+            errorMessage: PROVIDER_RUNTIME_HEADERS_UNAVAILABLE,
+        });
+        return;
+    }
+    if (!perm && !(isUserInputRequestUnchecked(method) && (epm || ask))) {
+        warn(`  ⚠ unhandled server→client request: ${method} (id=${zcodeReqId})`);
+        sendZcodeError(backend, zcodeReqId, `bridge unsupported: ${method}`);
+        return;
+    }
+    // Reannounce dedup.
+    const dedupKey = params.requestId ??
+        params.toolCallId ??
+        null;
+    if (dedupKey && pending.has(dedupKey)) {
+        const entry = pending.get(dedupKey);
+        if (entry.result !== undefined) {
+            // Result already cached (client responded earlier): reply directly with
+            // {id, result} so zcode resolves the reannounced request. Must NOT use
+            // notify() (that writes {method, params}, not a valid response).
+            backend.sendReply(zcodeReqId, entry.result);
+            log(`  ⟳ reannounce, returning cached result (zcode_id=${zcodeReqId})`);
+        }
+        else {
+            entry.zcodeIds.push(zcodeReqId);
+            log(`  ⟳ reannounce, recording zcode_id=${zcodeReqId} (no re-prompt)`);
+        }
+        return;
+    }
+    if (dedupKey)
+        pending.set(dedupKey, { zcodeIds: [zcodeReqId] });
+    // Settle-once: whatever happens during the forward, zcode must get exactly
+    // one reply and the dedup entry must resolve. An unanswered request makes
+    // the backend reannounce forever, and every reannounce refreshes the turn
+    // loop's no-progress timer — the 120s timeout never fires and the turn
+    // hangs. Any throw degrades to decline instead of propagating.
+    let zcodeResp;
+    try {
+        if (ask) {
+            zcodeResp = await handleAskUserQuestion(server, cx, acpSid, params, turn);
+        }
+        else {
+            zcodeResp = await handleSinglePermission(server, cx, acpSid, params, epm, perm, turn);
+        }
+    }
+    catch (e) {
+        warn(`  ⚠ interaction forward threw, declining: ${e instanceof Error ? e.message : String(e)}`);
+        zcodeResp = { action: "decline", reason: "bridge error during forward" };
+    }
+    // Reply to the first zcode id + all reannounced ones, and cache for late reannounces.
+    sendInteractionReply(backend, pending, dedupKey, zcodeReqId, zcodeResp);
+    // ExitPlanMode approval switches the session mode (plan → build/etc.), but
+    // the backend applies it asynchronously — an immediate session/read still
+    // sees the pre-exit mode. Probe once after a delay to read the real post-exit
+    // mode, then push it via config_option_update: Zed's config_state() drops
+    // session_modes to None when session/new returns configOptions, so
+    // current_mode_update is silently ignored — only config_option_update drives
+    // the mode dropdown's selection.
+    if (epm && zcodeResp.action === "accept") {
+        const zcodeSid = server.resolveSid(acpSid);
+        if (zcodeSid) {
+            void sleep(1000).then(() => emitModeViaConfigOption(server, cx, acpSid, zcodeSid).catch(() => { }));
+        }
+    }
+}
+/** Single requestPermission (tool auth / ExitPlanMode). */
+async function handleSinglePermission(server, cx, acpSid, params, epm, perm, turn) {
+    const p = params;
+    // Emit a tool_call first so Zed renders the popup (it requires the toolCallId
+    // to have been emitted before request_permission).
+    const toolCallId = p.toolCallId ?? "";
+    const rawInput = p.input;
+    const m = messages();
+    const tcTitle = epm
+        ? m.popupTitleExitPlan
+        : perm
+            ? m.popupTitleToolPermission(p.toolName ?? "?")
+            : m.popupTitleInteraction;
+    const tcKind = epm ? "switch_mode" : "other";
+    const toolName = epm ? "ExitPlanMode" : (p.toolName ?? "");
+    const tcUpdate = {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: tcTitle,
+        kind: tcKind,
+        status: "pending",
+        rawInput,
+        _meta: { claudeCode: { toolName } },
+    };
+    if (epm && rawInput && typeof rawInput === "object") {
+        const planText = rawInput.plan;
+        if (planText) {
+            tcUpdate.content = [{ type: "content", content: { type: "text", text: planText } }];
+        }
+    }
+    await sendSessionUpdate(cx, acpSid, tcUpdate);
+    // ExitPlanMode routing splits by client KIND, not by form capability:
+    //   - martty gets an elicitation FORM: its request_permission overlay draws
+    //     only the title — a one-line popup can never show a plan, while the
+    //     form renders the plan markdown in a scrollable detail pane.
+    //   - Every other client (Zed, remote apps) keeps session/request_permission:
+    //     editors render toolCall.content as full markdown (Zed: MarkdownElement,
+    //     code blocks and links included), while elicitation form descriptions
+    //     are plain Labels there (verified against Zed v1.19.2 sources) — the
+    //     form would DOWNGRADE the plan display. Zed ≥1.12 declares
+    //     elicitation.form, so a capability gate cannot tell the two apart;
+    //     only martty actually needs the form.
+    // Both converge on the same zcode accept/decline response shape, and the
+    // form path still falls back to request_permission if the form channel
+    // fails (see handlePlanApprovalViaElicitation).
+    if (epm && server.hasMarttyClient()) {
+        const elicited = await handlePlanApprovalViaElicitation(server, cx, acpSid, p, turn);
+        // null = the form channel failed (capability flags are OR-merged across
+        // clients at initialize and survive detach, so the flag can outlive the
+        // form-capable client). Fall through to request_permission below — every
+        // client can answer that popup — instead of silently declining the plan.
+        if (elicited !== null)
+            return elicited;
+    }
+    const acpParams = perm
+        ? zcodePermissionToAcp(p, acpSid)
+        : exitPlanModeToAcpPermission(p, acpSid);
+    const acpReqId = server.nextId();
+    log(`  ⟳ ${toolName || "permission"}, forwarding session/request_permission (acp_id=${acpReqId})`);
+    const acpResp = await requestWithTimeout(server, cx, "session/request_permission", acpParams, "request_permission", undefined, turn);
+    if (acpResp === INTERRUPTED) {
+        return onInteractionInterrupted(cx, acpSid, toolCallId, turn);
+    }
+    if (acpResp === null) {
+        return { action: "decline", reason: "declined or cancelled" };
+    }
+    return perm
+        ? acpPermissionResponseToZcode(acpResp)
+        : acpPermissionResponseToExitPlanMode(acpResp);
+}
+/**
+ * AskUserQuestion: sequential per-question, multi-select per-option.
+ *
+ * Single-select: one popup per question; Skip/cancel → overall decline.
+ * Multi-select: one Include/Skip popup per option; Include picks comma-joined.
+ */
+export async function handleAskUserQuestion(server, cx, acpSid, params, turn) {
+    const qs = splitAskUserQuestions(params);
+    if (qs === null) {
+        warn("  ⚠ AskUserQuestion: no valid questions, declining");
+        return { action: "decline", reason: "no valid questions" };
+    }
+    const toolCallId = params.toolCallId ?? "";
+    const rawInput = params.input;
+    // Preferred path: form-based elicitation renders all questions in one form.
+    if (server.supportsElicitationForm()) {
+        return handleAskUserViaElicitation(server, cx, acpSid, params, toolCallId, rawInput, turn);
+    }
+    // Fallback path: per-question request_permission popups.
+    const answers = {};
+    for (let idx = 0; idx < qs.length; idx++) {
+        const q = qs[idx];
+        if (!q.multiSelect) {
+            // Single-select: one popup.
+            await emitAskToolCall(cx, acpSid, toolCallId, idx, q.question, rawInput);
+            const acpParams = buildAskUserAcpParams(params, acpSid, q.options, q.question);
+            acpParams.toolCall.toolCallId = `${toolCallId}_${idx}`;
+            const resp = await askOnce(server, cx, acpParams, idx + 1, qs.length, q.question, turn);
+            if (turn?.cancelled) {
+                warn(`  ⚠ AskUserQuestion [${idx + 1}] aborted (turn cancelled), declining`);
+                return { action: "decline", reason: "turn cancelled" };
+            }
+            const selected = parseAskUserResponse(resp);
+            if (selected === null) {
+                warn(`  ⚠ AskUserQuestion [${idx + 1}] skip/cancel, declining`);
+                return { action: "decline", reason: "skipped or cancelled" };
+            }
+            answers[q.question] = selected;
+            log(`  ✓ AskUserQuestion [${idx + 1}] answer: ${selected}`);
+        }
+        else {
+            // Multi-select: per-option yes/no. options is [opt0_yes, opt0_no, opt1_yes, opt1_no, ...].
+            const pairs = [];
+            for (let i = 0; i < q.options.length; i += 2) {
+                const yesOpt = q.options[i];
+                const noOpt = q.options[i + 1];
+                if (!yesOpt || !noOpt)
+                    continue;
+                pairs.push({ label: yesOpt.optionId.replace(/:yes$/, ""), pair: [yesOpt, noOpt] });
+            }
+            const picked = [];
+            for (let sub = 0; sub < pairs.length; sub++) {
+                const { label, pair } = pairs[sub];
+                const promptText = `${q.question}\n— include "${label}"?`;
+                await emitAskToolCall(cx, acpSid, toolCallId, `${idx}_${sub}`, promptText, rawInput);
+                const acpParams = buildAskUserAcpParams(params, acpSid, pair, promptText);
+                acpParams.toolCall.toolCallId = `${toolCallId}_${idx}_${sub}`;
+                const resp = await askOnce(server, cx, acpParams, idx + 1, qs.length, label, turn);
+                // Abort the whole multi-select if the turn was cancelled (user sent a
+                // new prompt) or the popup returned nothing — otherwise the remaining
+                // options keep popping up and block the new task. Mirrors the
+                // single-select path's null → decline behaviour.
+                if (turn?.cancelled || resp === null) {
+                    warn(`  ⚠ AskUserQuestion [${idx + 1}] multi aborted (cancel/interrupt), declining`);
+                    return { action: "decline", reason: "cancelled or interrupted" };
+                }
+                if (parseAskUserResponse(resp) === "yes") {
+                    picked.push(label);
+                    log(`  ✓ AskUserQuestion [${idx + 1}] multi picked: ${label}`);
+                }
+                else {
+                    log(`  · AskUserQuestion [${idx + 1}] multi skipped: ${label}`);
+                }
+            }
+            answers[q.question] = picked.join(", ");
+            log(`  ✓ AskUserQuestion [${idx + 1}] multi answer: ${answers[q.question] || "(none)"}`);
+        }
+    }
+    log(`  ✓ AskUserQuestion all answered (${Object.keys(answers).length}), replying`);
+    return { action: "accept", content: { answers } };
+}
+/**
+ * AskUserQuestion via elicitation form — one form for all questions.
+ *
+ * When the client supports form-based elicitation, render a single form with
+ * one field per question instead of N sequential popups. Falls back to
+ * `decline` on any failure so the caller can degrade gracefully.
+ */
+async function handleAskUserViaElicitation(server, cx, acpSid, params, toolCallId, rawInput, turn) {
+    const toolName = "AskUserQuestion";
+    await sendSessionUpdate(cx, acpSid, {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: messages().askQuestionsTitle,
+        kind: "other",
+        status: "pending",
+        rawInput,
+        _meta: { claudeCode: { toolName } },
+    });
+    const formParams = buildAskUserElicitationForm(params, acpSid, toolCallId || undefined);
+    log(`  ⟳ AskUserQuestion forwarding elicitation/create (form, ${Object.keys(formParams.requestedSchema.properties).length} fields)`);
+    const acpResp = await requestWithTimeout(server, cx, "elicitation/create", formParams, "elicitation/create", undefined, turn);
+    if (acpResp === INTERRUPTED) {
+        return onInteractionInterrupted(cx, acpSid, toolCallId, turn);
+    }
+    if (acpResp === null) {
+        return { action: "decline", reason: "elicitation failed" };
+    }
+    const answers = parseAskUserElicitationResponse(acpResp, params);
+    if (answers === null) {
+        warn("  ⚠ AskUserQuestion elicitation declined/cancelled");
+        return { action: "decline", reason: "declined or cancelled" };
+    }
+    log(`  ✓ AskUserQuestion elicitation answered (${Object.keys(answers).length})`);
+    return { action: "accept", content: { answers } };
+}
+/**
+ * ExitPlanMode via elicitation form — the plan-review surface for
+ * form-capable clients. The form's field description carries the complete
+ * plan markdown (martty renders it scrollable in a detail pane); the decision
+ * is a required approve/reject enum. Cancelled/declined forms map to decline.
+ * Returns null when the form channel itself failed (timeout, or no client that
+ * can answer elicitation any more) so the caller can fall back to
+ * request_permission.
+ */
+async function handlePlanApprovalViaElicitation(server, cx, acpSid, params, turn) {
+    const toolCallId = params.toolCallId ?? "";
+    const formParams = buildPlanApprovalElicitationForm(params, acpSid, toolCallId || undefined);
+    log("  ⟳ ExitPlanMode forwarding elicitation/create (form, plan review)");
+    const acpResp = await requestWithTimeout(server, cx, "elicitation/create", formParams, "plan approval (elicitation)", undefined, turn);
+    if (acpResp === INTERRUPTED) {
+        return onInteractionInterrupted(cx, acpSid, toolCallId, turn);
+    }
+    if (acpResp === null) {
+        warn("plan approval elicitation got no form response; falling back to request_permission");
+        return null;
+    }
+    const resp = parsePlanApprovalElicitationResponse(acpResp);
+    log(`  ✓ plan approval: ${resp.action}`);
+    return resp;
+}
+/** Emit the prerequisite tool_call for an AskUserQuestion popup. */
+async function emitAskToolCall(cx, acpSid, toolCallId, idxSuffix, qText, rawInput) {
+    await sendSessionUpdate(cx, acpSid, {
+        sessionUpdate: "tool_call",
+        toolCallId: `${toolCallId}_${idxSuffix}`,
+        title: qText,
+        kind: "other",
+        status: "pending",
+        rawInput,
+        _meta: { claudeCode: { toolName: "AskUserQuestion" } },
+        content: [{ type: "content", content: { type: "text", text: qText } }],
+    });
+}
+/**
+ * `/resume` session picker: ask the user to choose a past session via the
+ * editor's interaction UI — an `elicitation/create` enum dropdown when the
+ * client supports forms, else `session/request_permission` option buttons.
+ * Returns the chosen backend session id, or null when declined/cancelled or
+ * the request failed (no turn context — the slash path has no PendingTurn).
+ */
+export async function askSessionPick(server, cx, acpSid, items) {
+    if (items.length === 0)
+        return null;
+    if (server.supportsElicitationForm()) {
+        const resp = await requestWithTimeout(server, cx, "elicitation/create", {
+            mode: "form",
+            // Session scope is mandatory: schema-strict clients (Zed 1.18+) fail
+            // the whole request with -32602 when neither sessionId nor requestId
+            // is present, which surfaced as a silent "resume cancelled".
+            sessionId: acpSid,
+            message: messages().slashResumePickTitle,
+            requestedSchema: {
+                type: "object",
+                properties: {
+                    session: {
+                        type: "string",
+                        title: messages().slashResumePickTitle,
+                        // oneOf (const+title) renders a titled dropdown in Zed — the
+                        // raw session ids stay values, the labels stay visible.
+                        oneOf: items.map((i) => ({ const: i.sessionId, title: i.label })),
+                    },
+                },
+                required: ["session"],
+            },
+        }, "session pick (elicitation)");
+        if (resp === null || resp === INTERRUPTED)
+            return null;
+        const picked = resp.content?.session;
+        // Only accept a value we offered — a free-form answer can't name a row.
+        if (typeof picked === "string" && items.some((i) => i.sessionId === picked))
+            return picked;
+        return null;
+    }
+    const options = items.map((i) => ({
+        kind: "allow_once",
+        name: i.label,
+        optionId: i.sessionId,
+    }));
+    const resp = await requestWithTimeout(server, cx, "session/request_permission", { options, sessionId: acpSid, toolCall: { toolCallId: "resume_pick", rawInput: {} } }, "session pick (permission)");
+    if (resp === null || resp === INTERRUPTED)
+        return null;
+    const optionId = resp.outcome
+        ?.optionId;
+    if (optionId && items.some((i) => i.sessionId === optionId))
+        return optionId;
+    return null;
+}
+/** Send one requestPermission and await the response. */
+async function askOnce(server, cx, acpParams, _qNum, _qTotal, _label, turn) {
+    const acpReqId = server.nextId();
+    log(`  ⟳ AskUserQuestion forwarding session/request_permission (acp_id=${acpReqId})`);
+    const resp = await requestWithTimeout(server, cx, "session/request_permission", acpParams, "request_permission", undefined, turn);
+    if (resp === INTERRUPTED) {
+        // Interrupted (connection close / env timeout / cancel): mark the popup's
+        // tool_call failed and flip turn.cancelled so the outer loop aborts and the
+        // turn loop stops the backend. Return null so callers' existing null →
+        // decline branch handles the reply uniformly.
+        await onInteractionInterrupted(cx, acpParams.sessionId, acpParams.toolCall.toolCallId, turn);
+        return null;
+    }
+    return resp;
+}
+// ---------- request helpers ----------
+/**
+ * Interaction request wait strategy.
+ *
+ * By default we wait INDEFINITELY for the user to respond to a confirmation
+ * popup — this matches every mainstream agent (Claude Code, Gemini CLI, Codex,
+ * Cursor all wait forever for tool-auth/ExitPlanMode/AskUserQuestion; the ACP
+ * spec has no timeout on `session/request_permission`). A finite timeout that
+ * auto-declines is actively harmful: it decides for the user (often the
+ * opposite of their intent) and then keeps running, which is exactly the bug
+ * this fixed.
+ *
+ * Two things can still break a pending wait:
+ *   1. `turn.cancelled` — the user pressed stop / sent a new prompt (preempt).
+ *   2. Connection close (`cx.signal` abort / `cx.closed` resolves) — the editor
+ *      went away. This is the real crash signal and replaces the old timeout.
+ *
+ * An explicit timeout is kept as an opt-in escape hatch via the
+ * `ZCODE_ACP_INTERACTION_TIMEOUT_MS` env var (milliseconds; 0/unset = wait
+ * forever). On any of these interrupts the caller replies `decline` to unlock
+ * the backend AND flips `turn.cancelled` so the turn loop stops the backend
+ * turn instead of auto-continuing.
+ */
+const INTERACTION_TIMEOUT_MS = parseInteractionTimeout();
+function parseInteractionTimeout() {
+    const raw = process.env.ZCODE_ACP_INTERACTION_TIMEOUT_MS;
+    if (!raw)
+        return 0; // 0 = wait indefinitely
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+/**
+ * Marker returned when a wait was interrupted (connection close, env timeout,
+ * or turn cancel) as opposed to the client deliberately returning null. Callers
+ * flip `turn.cancelled` on this so the backend turn is stopped rather than
+ * allowed to continue after the decline reply.
+ */
+const INTERRUPTED = Symbol("interactionInterrupted");
+/**
+ * Send a client-side request and wait for the response. By default waits
+ * indefinitely (see {@link INTERACTION_TIMEOUT_MS}). Resolves to the client
+ * response, `null` if the client returned null/errored, or {@link INTERRUPTED}
+ * if the wait was broken by connection close / env timeout / turn cancel.
+ *
+ * The client request runs inside a tracked first-response-wins race (see
+ * {@link ActiveInteraction}): the broadcast proxy races the clients connected
+ * at fire time, and `resendPendingInteractions` can add targeted attempts at
+ * clients that attach mid-wait. After the wait settles (answered OR
+ * interrupted — the caller replies decline), the entry is dropped and every
+ * still-open attempt is aborted, dismissing the leftover dialogs.
+ */
+async function requestWithTimeout(server, cx, method, params, label, timeoutMs = INTERACTION_TIMEOUT_MS, turn) {
+    // Each racer may register timers / listeners that outlive the race. Collect
+    // disposers so we can tear them all down once ANY racer wins — otherwise the
+    // turn-cancel setInterval keeps firing its `warn + resolve` every 100ms for
+    // the rest of the process lifetime once turn.cancelled sticks true, producing
+    // an unbounded `aborted (turn cancelled)` storm that starves the event loop.
+    const disposers = [];
+    const settled = { done: false };
+    // Primary racer: the tracked interaction race (broadcast attempt + any
+    // reconnect re-sends). Failures surface as null, matching a single client
+    // request that errors.
+    const active = getActiveInteractions(server);
+    const entry = createActiveInteraction(method, params, label);
+    active.add(entry);
+    const racers = [
+        entry.promise.catch((e) => {
+            warn(`  ⚠ ${label} failed: ${e instanceof Error ? e.message : String(e)}`);
+            return null;
+        }),
+    ];
+    fireInteractionAttempt(entry, (options) => cx.request(method, params, options));
+    // Connection-close detection: replaces the old finite timeout as the crash
+    // guard. `cx.signal` is an AbortSignal that fires when the stream closes;
+    // `cx.closed` is the Promise form. Either being present is enough.
+    const signal = cx.signal;
+    const closed = cx.closed;
+    if (signal || closed) {
+        racers.push(new Promise((resolve) => {
+            const fire = () => {
+                if (settled.done)
+                    return;
+                settled.done = true;
+                warn(`  ⚠ ${label} aborted (client connection closed)`);
+                resolve(INTERRUPTED);
+            };
+            signal?.addEventListener("abort", fire);
+            if (signal)
+                disposers.push(() => signal.removeEventListener("abort", fire));
+            if (closed)
+                closed.then(fire).catch(() => { });
+        }));
+    }
+    // Optional env timeout (off by default).
+    if (timeoutMs > 0) {
+        racers.push(new Promise((resolve) => {
+            const t = setTimeout(() => {
+                if (settled.done)
+                    return;
+                settled.done = true;
+                warn(`  ⚠ ${label} timed out after ${timeoutMs}ms`);
+                resolve(INTERRUPTED);
+            }, timeoutMs);
+            t.unref?.();
+            disposers.push(() => clearTimeout(t));
+        }));
+    }
+    // Turn-cancel poll: lets the user abort a pending popup via stop/preempt.
+    if (turn) {
+        racers.push(new Promise((resolve) => {
+            const cancelTimer = setInterval(() => {
+                if (turn.cancelled) {
+                    if (settled.done)
+                        return;
+                    settled.done = true;
+                    warn(`  ⚠ ${label} aborted (turn cancelled)`);
+                    resolve(INTERRUPTED);
+                }
+            }, 100);
+            // unref so this polling interval cannot keep the event loop alive.
+            cancelTimer.unref?.();
+            disposers.push(() => clearInterval(cancelTimer));
+        }));
+    }
+    const winner = await Promise.race(racers);
+    // Mark settled BEFORE disposing: a non-primary racer can win while the
+    // interaction race is still open, and a later `closed.then(fire)` would
+    // otherwise pass its guard and emit a spurious "aborted (client connection
+    // closed)" warn long after a normal completion.
+    settled.done = true;
+    // Tear down every racer's timer/listener so the losers don't leak. The
+    // turn-cancel interval is the critical one: without this it fires forever.
+    for (const dispose of disposers) {
+        try {
+            dispose();
+        }
+        catch {
+            /* best-effort cleanup */
+        }
+    }
+    // The interaction is decided either way (answered, or interrupted — the
+    // caller replies decline): unregister it and dismiss dialogs still open on
+    // clients that never answered (abort → `$/cancel_request`).
+    active.delete(entry);
+    if (!entry.settled) {
+        entry.settled = true;
+        for (const ctrl of entry.controllers)
+            ctrl.abort();
+        entry.controllers.clear();
+    }
+    return winner;
+}
+/**
+ * Handle an interrupted interaction wait (connection close, env timeout, or
+ * turn cancel). Emits a `failed` tool_call_update so the editor shows a clear
+ * red marker, and flips `turn.cancelled` so the turn loop stops the backend
+ * turn instead of auto-continuing after the decline reply.
+ *
+ * Returns the decline response the caller should send back to zcode.
+ */
+async function onInteractionInterrupted(cx, acpSid, toolCallId, turn) {
+    if (toolCallId) {
+        await sendSessionUpdate(cx, acpSid, {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "failed",
+            content: [
+                {
+                    type: "content",
+                    content: { type: "text", text: messages().interactionInterrupted },
+                },
+            ],
+        }).catch(() => {
+            /* best-effort: editor may already be gone */
+        });
+    }
+    if (turn)
+        turn.cancelled = true;
+    return { action: "decline", reason: "interrupted (connection closed or timeout)" };
+}
+// ---------- reply helpers ----------
+/** Reply to the first zcode id + all reannounced ones, cache for late reannounces. */
+function sendInteractionReply(backend, pending, dedupKey, firstZcodeId, result) {
+    const ids = dedupKey && pending.has(dedupKey) ? pending.get(dedupKey).zcodeIds : [firstZcodeId];
+    if (dedupKey && pending.has(dedupKey)) {
+        pending.get(dedupKey).result = result;
+    }
+    for (const id of ids) {
+        sendZcodeReply(backend, id, result);
+    }
+    log(`  ✓ replied to zcode (${ids.length} request(s))`);
+    // Schedule cleanup so late reannounces (after the result) still hit the cache briefly.
+    if (dedupKey) {
+        setTimeout(() => pending.delete(dedupKey), 30_000).unref();
+    }
+}
+/** Send a zcode response (result) for a server→client request id. */
+function sendZcodeReply(backend, zcodeId, result) {
+    // zcode expects {id, result} — but our backend.notify sends {method, params}. Use a raw write.
+    // The backend's notify is for notifications; replies need the id. We route via a private seam.
+    backend.sendReply(zcodeId, result);
+}
+/** Send a zcode error response. */
+function sendZcodeError(backend, zcodeId, message) {
+    backend.sendError(zcodeId, -32601, message);
+}
+function isUserInputRequestUnchecked(method) {
+    return method === "interaction/requestUserInput";
+}
+/** @see handleOne — the Start Plan captcha-session request (issue #123). */
+function isProviderRuntimeHeadersRequest(method) {
+    return method === "interaction/requestProviderRuntimeHeaders";
+}
+/**
+ * Reason surfaced through the backend's -32031 error when it asks for a
+ * provider runtime headers (Aliyun captcha) refresh we cannot serve.
+ */
+const PROVIDER_RUNTIME_HEADERS_UNAVAILABLE = "Start Plan providers require an Aliyun captcha session that only the " +
+    "ZCode desktop app can provide. Use a GLM Coding Plan provider for " +
+    "headless/editor sessions (see docs/TROUBLESHOOTING.md).";
+//# sourceMappingURL=server-requests.js.map

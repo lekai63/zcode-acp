@@ -1,0 +1,110 @@
+/**
+ * Remote session rename endpoint, served on the bridge's loopback HTTP server
+ * and byte-proxied by the hub at
+ * POST /api/instances/{id}/sessions/{sessionId}/rename (JSON body: {title}).
+ *
+ * A rename is the ONLY way a session title changes after its one-shot
+ * auto-title (set once at the first prompt). The bridge applies it in-memory
+ * (sessionTitles + discovery summary), persists it to the App's tasks-index
+ * with title_overridden=1 — the same pin the App's own rename flow sets, so
+ * no later automatic write can touch it — and broadcasts session_info_update
+ * so attached editors and phones update live.
+ */
+import { sendSessionUpdate } from "../handlers/io.js";
+import { refreshTerminalTabTitle } from "../terminal-title.js";
+import { renameSessionTask } from "../tasks-index.js";
+import { log, warn } from "../utils.js";
+const MAX_BODY_BYTES = 4096;
+function sendText(res, code, message) {
+    if (res.writableEnded)
+        return;
+    res.writeHead(code, { "Content-Type": "text/plain" });
+    res.end(message);
+}
+function sendJson(res, code, body) {
+    const payload = JSON.stringify(body);
+    res.writeHead(code, {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload),
+    });
+    res.end(payload);
+}
+/**
+ * Read the request body as JSON without trusting Content-Type — the hub's
+ * forward-and-relay proxy pipes bytes through without forwarding headers.
+ */
+async function readJsonBody(req) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+        size += chunk.length;
+        if (size > MAX_BODY_BYTES)
+            throw new Error("body too large");
+        chunks.push(chunk);
+    }
+    if (chunks.length === 0)
+        return undefined;
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+async function handleRename(server, req, res, sessionId) {
+    let body;
+    try {
+        body = await readJsonBody(req);
+    }
+    catch {
+        sendText(res, 400, "invalid body");
+        return;
+    }
+    const rawTitle = body?.title;
+    if (typeof rawTitle !== "string" || rawTitle.trim().length === 0) {
+        sendText(res, 400, "title required");
+        return;
+    }
+    if (!server.sessionSummaries.has(sessionId)) {
+        sendText(res, 404, "unknown session");
+        return;
+    }
+    // Mirror the auto-title's normalization: single line, trimmed, 80 chars.
+    const title = rawTitle
+        .replace(/[\r\n]+/g, " ")
+        .trim()
+        .slice(0, 80);
+    server.sessionTitles.set(sessionId, title);
+    server.touchSessionSummary(sessionId, title);
+    refreshTerminalTabTitle(server, sessionId);
+    const zcodeSid = server.resolveSid(sessionId);
+    if (zcodeSid) {
+        try {
+            await renameSessionTask(zcodeSid, title);
+        }
+        catch (e) {
+            warn(`remote: rename persist failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+        }
+    }
+    await sendSessionUpdate(server.clients.broadcast(), sessionId, {
+        sessionUpdate: "session_info_update",
+        title,
+        updatedAt: new Date().toISOString(),
+    }).catch(() => undefined);
+    log(`remote: session ${sessionId.slice(0, 8)} renamed to "${title}"`);
+    sendJson(res, 200, { ok: true, title });
+}
+/**
+ * Build the /sessions/{id}/rename request handler for the loopback endpoint.
+ * Async failures degrade to a status code, never into the event loop.
+ */
+export function createSessionRenameHandler(server) {
+    return (req, res, sessionId) => {
+        if (req.method !== "POST") {
+            sendText(res, 405, "method not allowed");
+            return;
+        }
+        void handleRename(server, req, res, sessionId).catch(() => {
+            if (res.headersSent)
+                res.destroy();
+            else
+                sendText(res, 500, "internal error");
+        });
+    };
+}
+//# sourceMappingURL=session-rename-endpoint.js.map

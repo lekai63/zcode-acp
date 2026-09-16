@@ -1,0 +1,411 @@
+/**
+ * EventTranslator: turn zcode `session/event` pushes into internal event dicts.
+ *
+ * The output shape matches `ProjectionDiffer.diff()` (the `InternalEvent` union)
+ * so either can feed `dispatchEvent`. State held per-translator:
+ *   - seenToolIds / toolNames / toolInputs / finalToolIds for tool lifecycle
+ *   - turnStarted / turnDone / turnFailed / turnResultType / turnError for turn state
+ *
+ * A critical quirk: zcode streams tool input via `model.streaming tool_call`
+ * BEFORE the `tool.updated scheduled` event, whose `input` is then omitted
+ * (`inputOmitted:true`). So we cache input from `tool_call` and fall back to
+ * it when `scheduled` arrives without input.
+ */
+import { log, warn } from "../utils.js";
+import { buildResultContent, extractLocations, renderToolOutput, summarizeToolInput, TOOL_KIND_MAP, } from "./tool-helpers.js";
+/**
+ * Whether a tool input dict declared `run_in_background: true`. Used to tag
+ * ToolCallNew/Update events so the dispatcher and BackgroundTaskListener can
+ * keep the launch card in_progress and own its lifecycle via out-of-band
+ * `session.updated` events (rather than closing it the instant the launch
+ * acknowledgement returns).
+ */
+function isBackgroundInput(inp) {
+    if (!inp || typeof inp !== "object" || Array.isArray(inp))
+        return false;
+    return inp["run_in_background"] === true;
+}
+export class EventTranslator {
+    turnStarted = false;
+    turnDone = false;
+    turnFailed = false;
+    turnResultType = null;
+    turnError = null;
+    /**
+     * Usage object from this turn's `turn.completed` payload, verbatim from the
+     * backend. The backend merges every model call's usage into one billing-
+     * grade object ({source, modelRequestCount, inputTokens, outputTokens,
+     * totalTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens,
+     * webFetchRequests, webSearchRequests}); it is omitted when no model call
+     * reported usage. Per-turn scope, not session-cumulative. Consumed by the
+     * prompt loop to fill the ACP `PromptResponse.usage` field.
+     */
+    turnUsage = null;
+    /**
+     * True while inside a background-task notification turn
+     * (`turn.started {inputSource:"background_task"}`). Set on its turn.started,
+     * cleared on the next user-initiated turn.started. While true, `translate`
+     * drops all events — that turn is owned by BackgroundTaskListener.
+     */
+    skippingBackgroundTurn = false;
+    /**
+     * turnId of the user turn this translator owns (from its `turn.started`).
+     * Backend-internal turns (`session/goal` set, `session/compact`) emit their
+     * own turn.started/turn.completed on the SAME session mid-turn: without
+     * attribution, their turn.completed flipped turnDone and the bridge ended
+     * the user's turn while the backend kept generating (the "ghost completed"
+     * remote-status bug). turnId-less backends keep the old behavior (both ids
+     * must be present for a mismatch to drop an event).
+     */
+    activeTurnId = null;
+    skippingForeignTurn = false;
+    /**
+     * Backend message ids (`assistantMessageId`) whose TEXT reached this
+     * translator via the live event stream. Used by the turn loop to dedup the
+     * turn-completion fallback replay: a message already streamed live must not
+     * be re-emitted by `ProjectionDiffer.diff()`, while messages produced while
+     * no listener was attached (e.g. a backend turn resumed after compaction)
+     * have no live deltas and must be replayed.
+     *
+     * TEXT-only by contract. Text and reasoning share one assistant message id
+     * (the differ tags both replays with `m.info.id`), and GLM-style backends
+     * stream the text live while the CoT reaches us only via the completion
+     * snapshot — a shared set would let the streamed text suppress the reasoning
+     * replay entirely.
+     */
+    deliveredMessageIds = new Set();
+    /**
+     * Same contract as `deliveredMessageIds`, for REASONING content. Kept
+     * separate so live-streamed reasoning never suppresses the differ's
+     * reasoning replay (and vice versa: streamed text must not).
+     */
+    deliveredReasoningMessageIds = new Set();
+    /** Tool call ids we've already emitted a ToolCallNew for. */
+    seenToolIds = new Set();
+    /** call_id → tool_name (result/error events omit toolName). */
+    toolNames = new Map();
+    /** call_id → input dict cached from model.streaming tool_call. */
+    toolInputs = new Map();
+    /** Tool call ids that reached a terminal state (result/error). */
+    finalToolIds = new Set();
+    /**
+     * call_ids launched with `run_in_background: true`. Populated when the
+     * scheduled event resolves the input (streaming cache or payload), so the
+     * later `result` event — whose input is omitted — can still mark its
+     * ToolCallUpdate as background. Read by `translateTool` to thread the flag
+     * through to dispatch (which skips terminal_exit for background Bash).
+     */
+    backgroundCallIds = new Set();
+    /** Translate one zcode event into 0..n internal events. */
+    translate(event) {
+        const etype = event.type ?? "";
+        const payload = event.payload ?? {};
+        const results = [];
+        if (etype === "turn.started") {
+            // Background-task completion triggers an automatic backend turn
+            // (`inputSource:"background_task"`) whose text_delta is the task result.
+            // That turn is owned by the BackgroundTaskListener (session-scoped), NOT
+            // this per-prompt translator — if we consumed it we'd (a) double-forward
+            // the result and (b) mis-set turnDone and exit the user's real turn loop.
+            // So we skip every event of a background_task turn until the next
+            // user-initiated turn.started clears the flag.
+            const inputSource = payload["inputSource"];
+            if (inputSource === "background_task") {
+                this.skippingBackgroundTurn = true;
+                log("  [event] turn.started (background_task) → deferring to bg listener");
+                return results;
+            }
+            this.skippingBackgroundTurn = false;
+            const turnId = payload["turnId"] ?? null;
+            if (!this.turnStarted) {
+                this.activeTurnId = turnId;
+                this.skippingForeignTurn = false;
+            }
+            else if (turnId && this.activeTurnId && turnId !== this.activeTurnId) {
+                // A second, different turn started mid-turn: a backend-internal turn
+                // (goal set / compact). Its events belong to that turn — drop them
+                // until it completes and our own turn's events resume.
+                this.skippingForeignTurn = true;
+                log(`  [event] turn.started (foreign turn ${turnId.slice(-8)}) → skipping its events`);
+                return results;
+            }
+            this.turnStarted = true;
+            log("  [event] turn.started");
+        }
+        else if (this.skippingBackgroundTurn) {
+            // Inside a deferred background_task turn: drop everything (the bg
+            // listener handles it). turn.completed/turn.failed for the bg turn also
+            // land here and are intentionally NOT used to set turnDone.
+            return results;
+        }
+        else if (etype === "turn.completed" || etype === "turn.failed") {
+            const evTurnId = payload["turnId"] ?? null;
+            if (this.skippingForeignTurn) {
+                // A turn ended while a foreign (internal) turn was in flight. When it
+                // provably belongs to the foreign turn, drop it and resume normal
+                // processing. When it names OUR turn (the user turn can complete
+                // before the internal one), fall through — swallowing it here would
+                // leave turnDone unset and the turn loop waiting out STALE_FREEZE_MS.
+                this.skippingForeignTurn = false;
+                if (!(evTurnId && this.activeTurnId && evTurnId === this.activeTurnId)) {
+                    log(`  [event] ${etype} (foreign turn) → ignored`);
+                    return results;
+                }
+            }
+            if (evTurnId && this.activeTurnId && evTurnId !== this.activeTurnId) {
+                log(`  [event] ${etype} (turnId mismatch) → ignored`);
+                return results;
+            }
+            if (etype === "turn.completed") {
+                this.turnDone = true;
+                this.turnResultType = payload["resultType"] ?? "success";
+                this.turnUsage = payload["usage"] ?? null;
+                results.push(...this.translateTurnDone(payload));
+                log(`  [event] turn.completed (resultType=${this.turnResultType})`);
+            }
+            else {
+                this.turnDone = true;
+                this.turnFailed = true;
+                this.turnError = payload["error"] ?? {};
+                this.turnResultType = payload["resultType"] ?? "error";
+                const err = this.turnError;
+                warn(`  [event] turn.failed (code=${err["code"] ?? err["type"] ?? "?"})`);
+            }
+        }
+        else if (this.skippingForeignTurn) {
+            return results;
+        }
+        else if (etype === "model.streaming") {
+            results.push(...this.translateStreaming(payload));
+        }
+        else if (etype === "tool.updated") {
+            results.push(...this.translateTool(payload));
+        }
+        else if (etype === "session.updated") {
+            const usage = payload["usage"] ?? {};
+            const used = usage["inputTokens"];
+            const size = payload["contextWindow"] ?? 0;
+            if (typeof used === "number") {
+                results.push({ kind: "UsageDelta", used, size });
+            }
+        }
+        else if (etype === "state.updated") {
+            // Session settings changed (model/mode/thoughtLevel switch, incl.
+            // mid-turn). The backend notification carries the authoritative full
+            // settings patch — forward the new values so the editor UI follows the
+            // switch immediately instead of at the next turn's completion.
+            results.push(...this.translateStateUpdated(payload));
+        }
+        return results;
+    }
+    /**
+     * `state.updated` → one ConfigChanged event carrying the new settings values.
+     * Payload shape (wrapped from the backend notification's params):
+     *   { patch: { mode: {current}, model: {current:{providerId,modelId}},
+     *              thoughtLevel: {current} }, reason, revision, sessionId }
+     * Fields missing from the patch are omitted — the dispatcher only emits
+     * updates for what actually changed.
+     */
+    translateStateUpdated(payload) {
+        const patch = payload["patch"] ?? {};
+        const ev = { kind: "ConfigChanged" };
+        const mode = patch["mode"]?.current;
+        if (typeof mode === "string")
+            ev.mode = mode;
+        const model = patch["model"]?.current;
+        if (model && typeof model["providerId"] === "string" && typeof model["modelId"] === "string") {
+            ev.model = { providerId: model["providerId"], modelId: model["modelId"] };
+        }
+        const thought = patch["thoughtLevel"]?.current;
+        if (typeof thought === "string")
+            ev.thought = thought;
+        return [ev];
+    }
+    translateStreaming(payload) {
+        const results = [];
+        const kind = payload["kind"] ?? "";
+        const delta = payload["delta"] ?? "";
+        // Record the owning assistant message so the turn loop can distinguish
+        // "already streamed live" from "produced while no listener was attached"
+        // when replaying missing content at turn completion. Per-content-kind:
+        // text and reasoning share one assistantMessageId, and the completion
+        // replay must stay able to deliver the kind that did NOT stream live
+        // (GLM: text streams, reasoning arrives only via the snapshot).
+        const msgId = payload["assistantMessageId"];
+        if (typeof msgId === "string" && msgId) {
+            if (kind === "reasoning_delta")
+                this.deliveredReasoningMessageIds.add(msgId);
+            else if (kind === "text_delta")
+                this.deliveredMessageIds.add(msgId);
+        }
+        // Carry the owning backend message id onto the emitted delta so the ACP
+        // chunk keeps one messageId per assistant message instead of one per turn.
+        const ownerId = typeof msgId === "string" && msgId ? msgId : undefined;
+        if (kind === "text_delta") {
+            if (delta)
+                results.push({
+                    kind: "TextDelta",
+                    text: delta,
+                    ...(ownerId ? { messageId: ownerId } : {}),
+                });
+        }
+        else if (kind === "reasoning_delta") {
+            if (delta)
+                results.push({
+                    kind: "ReasoningDelta",
+                    text: delta,
+                    ...(ownerId ? { messageId: ownerId } : {}),
+                });
+        }
+        else if (kind === "tool_call") {
+            // Cache input + toolName for the later scheduled event.
+            const callId = payload["toolCallId"] ?? "";
+            if (callId) {
+                if (payload["toolName"])
+                    this.toolNames.set(callId, payload["toolName"]);
+                if (payload["input"] !== undefined)
+                    this.toolInputs.set(callId, payload["input"]);
+            }
+        }
+        return results;
+    }
+    translateTool(payload) {
+        const results = [];
+        const tkind = payload["kind"] ?? "";
+        const callId = payload["toolCallId"] ?? "";
+        const toolName = payload["toolName"] ?? "";
+        if (tkind === "scheduled") {
+            const newEv = this.createToolCall(callId, toolName, payload["input"], "pending");
+            if (newEv)
+                results.push(newEv);
+        }
+        else if (tkind === "started") {
+            if (callId) {
+                const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
+                if (newEv) {
+                    results.push(newEv);
+                }
+                else {
+                    results.push({ kind: "ToolCallUpdate", callId, status: "in_progress" });
+                }
+            }
+        }
+        else if (tkind === "progress") {
+            if (callId) {
+                const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
+                if (newEv)
+                    results.push(newEv);
+                const output = payload["stdoutTail"] ?? payload["stderrTail"] ?? "";
+                const tn = (toolName || this.toolNames.get(callId)) ?? "";
+                results.push({
+                    kind: "ToolCallUpdate",
+                    callId,
+                    tool: tn,
+                    status: "in_progress",
+                    output: renderToolOutput(output),
+                    rawOutput: output,
+                });
+            }
+        }
+        else if (tkind === "result") {
+            if (callId) {
+                const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
+                if (newEv)
+                    results.push(newEv);
+                const resultPayload = payload["result"];
+                const tn = (toolName || this.toolNames.get(callId)) ?? "";
+                const ev = {
+                    kind: "ToolCallUpdate",
+                    callId,
+                    tool: tn,
+                    status: "completed",
+                    output: renderToolOutput(resultPayload),
+                    rawResult: resultPayload,
+                    ...(this.backgroundCallIds.has(callId) ? { background: true } : {}),
+                };
+                // Bash content handled by the terminal path in dispatch; skip here.
+                if (tn !== "Bash" && tn !== "bash") {
+                    const content = buildResultContent(tn, resultPayload);
+                    if (content.length > 0)
+                        ev.content = content;
+                }
+                results.push(ev);
+                this.finalToolIds.add(callId);
+            }
+        }
+        else if (tkind === "error") {
+            if (callId) {
+                const newEv = this.createToolCall(callId, toolName, payload["input"], "in_progress");
+                if (newEv)
+                    results.push(newEv);
+                const tn = (toolName || this.toolNames.get(callId)) ?? "";
+                const errPayload = payload["error"];
+                const ev = {
+                    kind: "ToolCallUpdate",
+                    callId,
+                    tool: tn,
+                    status: "failed",
+                    output: renderToolOutput(errPayload),
+                    ...(this.backgroundCallIds.has(callId) ? { background: true } : {}),
+                };
+                const content = buildResultContent(tn, errPayload, true);
+                if (content.length > 0)
+                    ev.content = content;
+                results.push(ev);
+                this.finalToolIds.add(callId);
+            }
+        }
+        else if (tkind === "batch") {
+            // Multi-tool completion. Only backfill unseen or non-final ids, else a
+            // content-less `completed` would overwrite a prior result event.
+            const batchIds = payload["toolCallIds"] ?? [];
+            const errorCount = payload["errorCount"] ?? 0;
+            const finalStatus = errorCount > 0 ? "failed" : "completed";
+            for (const bid of batchIds) {
+                if (this.seenToolIds.has(bid) && !this.finalToolIds.has(bid)) {
+                    results.push({ kind: "ToolCallUpdate", callId: bid, status: finalStatus });
+                    this.finalToolIds.add(bid);
+                }
+            }
+        }
+        return results;
+    }
+    /** Create the first ACP tool event, even if the backend omitted `scheduled`. */
+    createToolCall(callId, eventToolName, eventInput, status) {
+        if (!callId || this.seenToolIds.has(callId))
+            return null;
+        this.seenToolIds.add(callId);
+        const toolName = eventToolName || this.toolNames.get(callId) || "unknown";
+        this.toolNames.set(callId, toolName);
+        const input = eventInput === undefined ? this.toolInputs.get(callId) : eventInput;
+        const summary = summarizeToolInput(toolName, input);
+        const isBackground = isBackgroundInput(input);
+        if (isBackground)
+            this.backgroundCallIds.add(callId);
+        const newEv = {
+            kind: "ToolCallNew",
+            callId,
+            tool: toolName,
+            acpKind: TOOL_KIND_MAP[toolName] ?? "execute",
+            status,
+            title: summary ? `${toolName}: ${summary}` : toolName,
+            ...(isBackground ? { background: true } : {}),
+        };
+        if (input !== undefined)
+            newEv.input = input;
+        const locations = extractLocations(toolName, input);
+        if (locations.length > 0)
+            newEv.locations = locations;
+        return newEv;
+    }
+    translateTurnDone(payload) {
+        const usage = payload["usage"] ?? {};
+        // Use || (not ??) to match Python's `or` semantics: a falsy totalTokens
+        // (0 / undefined) falls back to tokenCount, then to 0. With ?? a 0 would
+        // be kept as-is and never fall back, diverging from the Python reference.
+        const used = usage["totalTokens"] || payload["tokenCount"] || 0;
+        const size = usage["contextWindow"] || 0;
+        return [{ kind: "UsageDelta", used, size }];
+    }
+}
+//# sourceMappingURL=event-translator.js.map

@@ -1,0 +1,185 @@
+/**
+ * ZCode app-server protocol type definitions.
+ *
+ * ZCode speaks a line-delimited JSON protocol over stdio. It is JSON-RPC-like
+ * but deliberately omits the `jsonrpc` field. Messages are classified by the
+ * presence of `id` and `method`:
+ *   - id + no method        → response to a request we sent
+ *   - id + method           → either our response (id registered) or a server→client request
+ *   - method + no id        → notification (e.g. `session/event`)
+ *
+ * Only the fields we actually consume are typed; the rest pass through as
+ * `unknown`/`Record<string, unknown>` to stay resilient to ZCode schema drift.
+ */
+export interface ZcodeRequest {
+    id: number;
+    method: string;
+    params?: Record<string, unknown>;
+}
+export interface ZcodeNotification {
+    method: string;
+    params?: Record<string, unknown>;
+}
+export interface ZcodeResponse {
+    id: number;
+    result?: unknown;
+    error?: {
+        message: string;
+        code?: number | string;
+        detail?: unknown;
+    };
+}
+/** Any inbound message from the ZCode subprocess. */
+export type ZcodeInbound = Partial<ZcodeRequest> & Partial<ZcodeResponse> & Partial<ZcodeNotification>;
+export interface ZcodeSessionInfo {
+    sessionId: string;
+    title?: string;
+    traceId?: string;
+}
+export interface ZcodeCreateResult {
+    session: ZcodeSessionInfo;
+}
+export interface ZcodeSessionListItem {
+    sessionId: string;
+    workspace?: {
+        workspacePath?: string;
+    };
+    title?: string;
+    updatedAt?: number;
+}
+export interface ZcodeListResult {
+    sessions: ZcodeSessionListItem[];
+}
+export type ZcodeEventType = "turn.started" | "model.streaming" | "tool.updated" | "turn.completed" | "turn.failed" | "session.updated" | "state.updated" | "turn.steerQueued" | "turn.steerDrained" | "turn.terminal";
+export interface ZcodeEvent {
+    sessionId: string;
+    seq: number;
+    type: ZcodeEventType;
+    payload: Record<string, unknown>;
+}
+export interface ZcodeSubscribeResult {
+    eventSeq: number;
+    snapshot?: ZcodeSnapshot;
+}
+export interface ZcodeSnapshot {
+    projection?: ZcodeProjection;
+    messages?: ZcodeMessage[];
+    todos?: unknown[];
+}
+export interface ZcodeProjection {
+    status?: string;
+    contextUsed?: number;
+    contextWindow?: number;
+    totalTokenCount?: number;
+    /** Turns completed in this session (observed in app-server projections). */
+    turnCount?: number;
+    /** Id of the turn the projection considers current, if any. */
+    currentTurnId?: string;
+}
+export interface ZcodeMessage {
+    info: {
+        id?: string;
+        role: "user" | "assistant" | "system";
+        /**
+         * Harness semantics tag (newer backends). Identifies synthetic messages:
+         * compact_summary (compaction product), system_reminder / todo_reminder /
+         * background_notification (harness plumbing), timeline_event. Hidden
+         * plumbing carries transcriptVisibility: "hidden".
+         */
+        semantics?: {
+            kind?: string;
+            source?: string;
+            transcriptVisibility?: string;
+            uiVisibility?: string;
+        };
+        /** Compaction display form carried by compact_summary messages. */
+        summary?: {
+            title?: string;
+            body?: string;
+        };
+    };
+    parts: ZcodeMessagePart[];
+}
+export type ZcodeMessagePart = {
+    type: "text";
+    text: string;
+} | {
+    type: "reasoning";
+    text?: string;
+    content?: string;
+} | {
+    type: "tool";
+    callID?: string;
+    callId?: string;
+    tool?: string;
+    state?: Record<string, unknown>;
+} | {
+    type: "patch";
+    hash?: string;
+    files?: string[];
+} | {
+    type: string;
+    [key: string]: unknown;
+};
+export interface ZcodeMessagesResult {
+    messages: ZcodeMessage[];
+}
+export interface ZcodeReadResult {
+    projection?: ZcodeProjection;
+    settings?: Record<string, unknown>;
+    todos?: unknown[];
+    todoGroups?: Array<{
+        entries?: unknown[];
+        todos?: unknown[];
+    }>;
+}
+export interface ZcodeInteractionPermissionParams {
+    requestId: string;
+    sessionId: string;
+    toolCallId: string;
+    toolName?: string;
+    reason?: string;
+    riskLevel?: string;
+    input?: unknown;
+    options?: Array<{
+        optionId: string;
+        kind: string;
+        name: string;
+        response?: unknown;
+    }>;
+}
+export interface ZcodeInteractionUserInputParams {
+    requestId: string;
+    sessionId: string;
+    toolCallId?: string;
+    toolName?: string;
+    prompt?: string;
+    questions?: Array<{
+        header?: string;
+        question: string;
+        multiSelect?: boolean;
+        options?: Array<{
+            label?: string;
+            value?: string;
+            description?: string;
+        }>;
+    }>;
+    input?: {
+        questions?: ZcodeInteractionUserInputParams["questions"];
+    };
+    schema?: {
+        interaction?: string;
+        toolName?: string;
+    };
+}
+/** The response we send back to a ZCode server→client request. */
+export type ZcodeInteractionResponse = {
+    decision: "allow" | "deny" | "escalate" | "modify";
+    reason?: string;
+    modifiedInput?: unknown;
+} | {
+    action: "accept" | "decline" | "cancel";
+    content?: unknown;
+    reason?: string;
+};
+//# sourceMappingURL=types.d.ts.map

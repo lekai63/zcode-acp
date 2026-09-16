@@ -1,0 +1,1 @@
+{"version":3,"file":"file-endpoint.d.ts","sourceRoot":"","sources":["../../src/remote/file-endpoint.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;;;GAcG;AAIH,OAAO,KAAK,EAAE,eAAe,EAAE,cAAc,EAAE,MAAM,WAAW,CAAC;AAIjE,OAAO,KAAK,EAAE,cAAc,EAAE,MAAM,cAAc,CAAC;AAmXnD;;;GAGG;AACH,wBAAgB,iBAAiB,CAC/B,MAAM,EAAE,cAAc,GACrB,CAAC,GAAG,EAAE,eAAe,EAAE,GAAG,EAAE,cAAc,KAAK,IAAI,CAsBrD"}

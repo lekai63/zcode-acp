@@ -1,0 +1,419 @@
+/**
+ * ZCode subprocess client: spawn, read-loop multiplexer, async request/response.
+ *
+ * The ZCode app-server is launched as a subprocess (`zcode app-server --stdio`)
+ * speaking line-delimited JSON over stdio. A single async read loop demultiplexes
+ * inbound messages into three channels:
+ *   - responses (id, no method) → resolve the matching pending request promise
+ *   - server→client requests (id + method, id not pending) → server-request queue
+ *   - notifications (no id):
+ *       - `session/event` → routed to the registered session listener
+ *       - anything else   → general notification queue
+ *
+ * Process-group isolation: the subprocess is its own process-group leader
+ * (`detached: true`) so `close()` can kill the whole tree (zcode + its model
+ * workers) with `process.kill(-pid)` and leave no orphans.
+ */
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
+import process from "node:process";
+import { log, warn } from "../utils.js";
+export class ZcodeBackend {
+    proc;
+    pending = new Map();
+    serverRequests = [];
+    // Per-session listener SET so a long-lived session listener (e.g. background
+    // task monitor) can coexist with a per-turn EventStreamListener. Each event
+    // is delivered to every registered listener for the session.
+    listeners = new Map();
+    readerDead = false;
+    /** Monotonic id for fire-and-forget sends (send()). Uses a high range to
+     *  avoid collisions with the server's request ids (low range). */
+    sendIdCounter = 1_000_000_000;
+    /** Watchdog process that kills the zcode group if this bridge dies (SIGKILL). */
+    watchdog = null;
+    constructor(argv, env) {
+        this.proc = spawn(argv[0], argv.slice(1), {
+            stdio: ["pipe", "pipe", "ignore"],
+            env,
+            detached: true, // own process group → kill(-pid) reaps the whole tree
+        });
+        // Spawn failures (ENOENT when the CLI can't be resolved) arrive here
+        // asynchronously — without a listener the bridge dies on an unhandled
+        // 'error' event. Mark the backend dead so requests fail with a JSON-RPC
+        // error instead of crashing the whole process.
+        this.proc.on("error", (err) => {
+            const hint = err.code === "ENOENT"
+                ? `${this.proc.spawnfile} not found — install the zcode CLI, put it on PATH, or set ZCODE_BIN`
+                : err.message;
+            this.markReaderDead(`spawn failed: ${hint}`);
+        });
+        // Node stream write errors (EPIPE on a closed stdin) are emitted as async
+        // 'error' events, NOT thrown synchronously — without a listener the process
+        // crashes with an unhandled 'error' event. Catch them here and mark the
+        // reader dead so the rest of the bridge stops talking to a gone backend.
+        this.proc.stdin?.on("error", (err) => {
+            this.readerDead = true;
+            warn(`backend: stdin error: ${err.message}`);
+        });
+        this.startReader();
+        this.startWatchdog();
+        log(`backend: started zcode app-server (pid=${this.proc.pid})`);
+    }
+    /**
+     * Spawn a tiny detached watchdog that kills the zcode process group if this
+     * bridge process disappears.
+     *
+     * The detached/kill(-pid) cleanup in `close()` only runs when the bridge
+     * exits cleanly enough for the signal handlers to fire (SIGTERM/SIGINT/etc).
+     * If the bridge is SIGKILLed (Zed force-kill on reconnect, crash, OOM), the
+     * handler never runs and the zcode subprocess group is orphaned. The
+     * watchdog closes that gap: it polls the bridge pid every 2s and, once the
+     * bridge is gone, sends SIGKILL to the zcode process group, then exits.
+     *
+     * The watchdog is its own process-group leader (detached) and `unref`'d, so
+     * it never holds the event loop open and is not part of the zcode group it
+     * kills. It self-terminates as soon as the zcode process exits, so a normal
+     * shutdown leaves no lingering watchdog.
+     */
+    startWatchdog() {
+        const bridgePid = process.pid;
+        const zcodePid = this.proc.pid;
+        if (!bridgePid || !zcodePid)
+            return;
+        // Inline script: poll bridge liveness, kill zcode group on bridge death.
+        const script = `
+      const bridgePid = ${bridgePid};
+      const zcodePid = ${zcodePid};
+      const tick = () => {
+        // Bridge gone? → reap the whole zcode process group, then exit.
+        try { process.kill(bridgePid, 0); }
+        catch {
+          try { process.kill(-zcodePid, 'SIGKILL'); } catch {}
+          process.exit(0);
+        }
+        // zcode already exited? → watchdog has no job left.
+        try { process.kill(-zcodePid, 0); }
+        catch { process.exit(0); }
+      };
+      setInterval(tick, 2000);
+      tick();
+    `;
+        this.watchdog = spawn(process.execPath, ["-e", script], {
+            stdio: "ignore",
+            detached: true, // own process group, not part of the zcode group
+        });
+        this.watchdog.unref();
+    }
+    // ---------- read loop ----------
+    startReader() {
+        const stdout = this.proc.stdout;
+        if (!stdout) {
+            this.markReaderDead("no stdout");
+            return;
+        }
+        const rl = createInterface({ input: stdout });
+        rl.on("line", (line) => {
+            const trimmed = line.trim();
+            if (!trimmed)
+                return;
+            let msg;
+            try {
+                msg = JSON.parse(trimmed);
+            }
+            catch {
+                return; // unparseable line: ignore
+            }
+            this.route(msg);
+        });
+        rl.on("close", () => this.markReaderDead("stdout closed"));
+    }
+    route(msg) {
+        const method = msg.method;
+        const id = msg.id;
+        if (id !== undefined && method === undefined) {
+            // Response (id, no method) → resolve pending request.
+            this.resolvePending(id, msg);
+            return;
+        }
+        if (id !== undefined && method !== undefined) {
+            // id + method: our pending response wins the race; else it's a server→client request.
+            if (this.pending.has(id)) {
+                this.resolvePending(id, msg);
+            }
+            else if (method === "session/requestRuntimePreferences") {
+                // Newer app-servers block `session/create` until this handshake is
+                // answered. Reply with defaults — no editor interaction needed.
+                // Keep askUserQuestionAutoResolutionEnabled false so AskUserQuestion
+                // still flows through the bridge's interaction path instead of being
+                // auto-resolved server-side. Without this reply, create hangs.
+                log(`backend: auto-replying ${method} (id=${String(id)}) with default preferences`);
+                this.sendReply(id, {
+                    nativeSearchEnhancementsEnabled: false,
+                    memoryEnabled: false,
+                    askUserQuestionAutoResolutionEnabled: false,
+                });
+            }
+            else {
+                this.serverRequests.push({
+                    id,
+                    method,
+                    params: (msg.params ?? {}),
+                });
+            }
+            return;
+        }
+        if (method !== undefined) {
+            // Notification.
+            if (method === "session/event") {
+                const ev = (msg.params ?? {});
+                this.dispatchEvent(ev);
+            }
+            else if (method === "state.updated") {
+                // Session settings changed (model/mode/thoughtLevel switch, incl.
+                // mid-turn). The params carry the authoritative full settings patch:
+                //   { patch: {mode, model, thoughtLevel, …}, reason, revision, sessionId }
+                // Wrap as a ZcodeEvent so it flows through the same listener pipeline.
+                const params = (msg.params ?? {});
+                const ev = {
+                    sessionId: String(params.sessionId ?? ""),
+                    seq: 0,
+                    type: "state.updated",
+                    payload: params,
+                };
+                this.dispatchEvent(ev);
+            }
+            // Other notifications are currently ignored (process/resourceSample, …).
+        }
+    }
+    /** Deliver a ZcodeEvent to every listener registered for its session. */
+    dispatchEvent(ev) {
+        const sid = ev.sessionId;
+        const set = sid ? this.listeners.get(sid) : undefined;
+        if (set) {
+            // Iterate a snapshot so a listener that (un)registers during dispatch
+            // doesn't mutate the set under us.
+            for (const listener of [...set]) {
+                try {
+                    listener.handleEvent(ev);
+                }
+                catch (e) {
+                    warn(`backend: listener.handleEvent threw: ${e instanceof Error ? e.message : String(e)}`);
+                }
+            }
+        }
+    }
+    resolvePending(id, resp) {
+        const p = this.pending.get(id);
+        if (!p)
+            return;
+        clearTimeout(p.timer);
+        this.pending.delete(id);
+        p.resolve(resp);
+    }
+    markReaderDead(reason) {
+        if (this.readerDead)
+            return;
+        this.readerDead = true;
+        warn(`backend: reader exited (${reason})`);
+        for (const [, p] of this.pending) {
+            clearTimeout(p.timer);
+            p.resolve({
+                id: 0,
+                error: { message: "zcode backend reader exited (backend dead)" },
+            });
+        }
+        this.pending.clear();
+    }
+    // ---------- listeners / server requests ----------
+    registerEventListener(zcodeSid, listener) {
+        let set = this.listeners.get(zcodeSid);
+        if (!set) {
+            set = new Set();
+            this.listeners.set(zcodeSid, set);
+        }
+        set.add(listener);
+    }
+    unregisterEventListener(zcodeSid, listener) {
+        const set = this.listeners.get(zcodeSid);
+        if (!set)
+            return;
+        set.delete(listener);
+        if (set.size === 0)
+            this.listeners.delete(zcodeSid);
+    }
+    /** Non-blocking drain of pending server→client requests. */
+    pollServerRequests() {
+        if (this.serverRequests.length === 0)
+            return [];
+        return this.serverRequests.splice(0, this.serverRequests.length);
+    }
+    /**
+     * Re-queue server→client requests that belong to a different session (prepended
+     * to preserve arrival order). Used by `handleServerRequests` to put back
+     * requests it popped but doesn't own.
+     */
+    requeueServerRequests(reqs) {
+        if (reqs.length === 0)
+            return;
+        this.serverRequests.unshift(...reqs);
+    }
+    /** Reply to a zcode server→client request with a result (id + result). */
+    sendReply(id, result) {
+        const stdin = this.proc.stdin;
+        if (!stdin || stdin.destroyed) {
+            warn("backend: sendReply dropped (stdin closed)");
+            return;
+        }
+        // Write errors (EPIPE) are delivered via the stdin 'error' listener
+        // installed in the constructor (synchronous try/catch cannot catch them);
+        // no try/catch needed here.
+        stdin.write(JSON.stringify({ id, result }) + "\n");
+    }
+    /** Reply to a zcode server→client request with an error. */
+    sendError(id, code, message) {
+        const stdin = this.proc.stdin;
+        if (!stdin || stdin.destroyed) {
+            warn("backend: sendError dropped (stdin closed)");
+            return;
+        }
+        stdin.write(JSON.stringify({ id, error: { code, message } }) + "\n");
+    }
+    // ---------- send / request ----------
+    /** Fire-and-forget notification to ZCode (no id, no response). */
+    notify(method, params) {
+        const stdin = this.proc.stdin;
+        if (!stdin || stdin.destroyed) {
+            warn("backend: notify dropped (stdin closed)");
+            return;
+        }
+        stdin.write(JSON.stringify({ method, params }) + "\n");
+    }
+    /**
+     * Send a message with an id but WITHOUT registering a pending response
+     * (fire-and-forget). Mirrors Python's `_backend.send({"id": ..., ...})` for
+     * `session/stop`: some backends route by id presence, so carrying an id is
+     * more robust than a bare notify. If the backend replies, the reader's
+     * `resolvePending` finds no pending entry and safely discards it.
+     */
+    send(method, params) {
+        const stdin = this.proc.stdin;
+        if (!stdin || stdin.destroyed) {
+            warn("backend: send dropped (stdin closed)");
+            return;
+        }
+        const id = this.sendIdCounter++;
+        stdin.write(JSON.stringify({ id, method, params: params ?? {} }) + "\n");
+    }
+    /**
+     * Synchronous request/response: register a pending promise, send, await.
+     * Other notifications arriving during the wait are routed async by the
+     * reader loop (they don't get swallowed).
+     *
+     * Returns `{error}` on dead backend, broken pipe, or timeout — never throws.
+     */
+    async request(id, method, params, timeoutMs = 30000) {
+        if (this.readerDead) {
+            return { id, error: { message: "zcode backend reader exited (backend dead)" } };
+        }
+        const promise = new Promise((resolve) => {
+            const timer = setTimeout(() => {
+                if (this.pending.delete(id)) {
+                    resolve({ id, error: { message: "timeout" } });
+                }
+            }, timeoutMs);
+            this.pending.set(id, { resolve, timer });
+        });
+        try {
+            const stdin = this.proc.stdin;
+            if (!stdin || stdin.destroyed)
+                throw new Error("stdin closed");
+            stdin.write(JSON.stringify({ id, method, params: params ?? {} }) + "\n");
+        }
+        catch (e) {
+            this.pending.delete(id);
+            this.readerDead = true;
+            return {
+                id,
+                error: {
+                    message: `zcode backend pipe broken: ${e instanceof Error ? e.message : String(e)}`,
+                },
+            };
+        }
+        return promise;
+    }
+    // ---------- lifecycle ----------
+    /**
+     * Kill the whole zcode process group and wait for it to die.
+     *
+     * SIGTERM → wait up to 3s → SIGKILL if still alive. Mirrors the Python
+     * `os.killpg` + `proc.wait(3)` + SIGKILL escalation. Note `proc.killed` is
+     * NOT set by `process.kill(-pid)` (group signal), so we track liveness via
+     * `exitCode === null` instead. Async so the caller can `await` a full reap
+     * before the parent exits (an unref'd timer could be skipped on fast exit,
+     * leaving orphans).
+     */
+    async close() {
+        const proc = this.proc;
+        if (!proc.pid)
+            return;
+        try {
+            // Already exited?
+            if (proc.exitCode !== null || proc.signalCode)
+                return;
+            try {
+                process.kill(-proc.pid, "SIGTERM");
+            }
+            catch {
+                return; // group already gone
+            }
+            // Wait up to 3s for a clean exit.
+            const exited = await new Promise((resolve) => {
+                let timer;
+                const done = () => {
+                    clearTimeout(timer); // don't let the timeout keep the event loop alive
+                    resolve(true);
+                };
+                proc.once("exit", done);
+                timer = setTimeout(() => {
+                    proc.removeListener("exit", done);
+                    resolve(false);
+                }, 3000);
+            });
+            if (exited)
+                return;
+            // Still alive → SIGKILL the whole group.
+            try {
+                if (proc.pid && proc.exitCode === null)
+                    process.kill(-proc.pid, "SIGKILL");
+            }
+            catch {
+                // already gone
+            }
+        }
+        finally {
+            // Stop the watchdog — it would self-exit on its next tick once the zcode
+            // group is gone, but killing it here avoids the up-to-2s delay.
+            this.killWatchdog();
+        }
+    }
+    /** Terminate the watchdog process if it is still running. */
+    killWatchdog() {
+        const wd = this.watchdog;
+        if (!wd)
+            return;
+        this.watchdog = null;
+        if (wd.pid && wd.exitCode === null) {
+            try {
+                process.kill(wd.pid, "SIGTERM");
+            }
+            catch {
+                // already gone
+            }
+        }
+    }
+    get isDead() {
+        return this.readerDead;
+    }
+}
+//# sourceMappingURL=client.js.map
