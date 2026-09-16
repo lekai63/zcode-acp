@@ -83,13 +83,14 @@ export declare function orderThoughtVariants(variants: string[]): Array<{
     value: string;
     name: string;
 }>;
-/** Build the ACP configOptions array (3 items: model/mode/thought).
+/** Build the ACP configOptions array (model/mode/thought).
  *  zcodeSid null = pending session — skip the backend read and use defaults;
  *  mode defaults to "yolo" (the mode session/create hardcodes) so the dropdown
  *  matches the mode indicator for a fresh session.
  *  `receiverRoot` is the clientConnectionRoot of the client the array is
  *  delivered to — the quota pseudo-option is appended only for martty
- *  connections (ADR-0021); other receivers get the spec-clean 3 options. */
+ *  connections (ADR-0021), and the `mode` option is omitted for paseo
+ *  connections (they already surface the ACP session `modes`). */
 export declare function buildConfigOptions(server: ZcodeAcpServer, zcodeSid: string | null, receiverRoot?: unknown): Promise<acp.SessionConfigOption[]>;
 /**
  * Dispatch session/set_config_option. mode/thought forward to setMode/

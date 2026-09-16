@@ -205,3 +205,38 @@ describe("quota config option no-op", () => {
     expect(resp.configOptions.some((o) => o.id === "model")).toBe(true);
   });
 });
+
+describe("per-connection paseo gating", () => {
+  it("initialize records the paseo connection's root", async () => {
+    const server = new ZcodeAcpServer();
+    const paseoRoot = { id: "paseo" };
+    const otherRoot = { id: "zed" };
+    await server.initialize(
+      { clientInfo: { name: "paseo" } } as acp.InitializeRequest,
+      recordingCx(paseoRoot).cx,
+    );
+    await server.initialize(
+      { clientInfo: { name: "Zed" } } as acp.InitializeRequest,
+      recordingCx(otherRoot).cx,
+    );
+    expect(server.paseoConnectionRoots.has(paseoRoot)).toBe(true);
+    expect(server.paseoConnectionRoots.has(otherRoot)).toBe(false);
+  });
+
+  it("omits the redundant mode option for a paseo receiver only", async () => {
+    const server = new ZcodeAcpServer();
+    const paseoRoot = { id: "paseo" };
+    server.paseoConnectionRoots.add(paseoRoot);
+
+    const withPaseo = await buildConfigOptions(server, null, paseoRoot);
+    expect(withPaseo.some((o) => o.id === "mode")).toBe(false);
+    expect(withPaseo.some((o) => o.id === "model")).toBe(true);
+    expect(withPaseo.some((o) => o.id === "thought")).toBe(true);
+
+    const withOther = await buildConfigOptions(server, null, { id: "zed" });
+    expect(withOther.some((o) => o.id === "mode")).toBe(true);
+
+    const withNone = await buildConfigOptions(server, null);
+    expect(withNone.some((o) => o.id === "mode")).toBe(true);
+  });
+});

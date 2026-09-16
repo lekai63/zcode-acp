@@ -218,6 +218,14 @@ export class ZcodeAcpServer {
    */
   readonly marttyConnectionRoots = new Set<unknown>();
   /**
+   * Connection roots of Paseo clients (clientInfo name ≈"paseo"). Paseo already
+   * surfaces the ACP session `modes` as its own Mode control and switches via
+   * `session/set_mode`, so the redundant category-"mode" config option is
+   * omitted for these connections — otherwise Paseo renders it a second time as
+   * a setting.
+   */
+  readonly paseoConnectionRoots = new Set<unknown>();
+  /**
    * Latest formatted quota dock string (ADR-0021), or null when the last
    * refresh failed / has nothing to show. Maintained by src/quota/live.ts;
    * read by buildConfigOptions when appending the read-only `quota` option.
@@ -672,6 +680,10 @@ export class ZcodeAcpServer {
       this.marttyClientSeen = true;
       const root = clientConnectionRoot(client);
       if (root !== undefined) this.marttyConnectionRoots.add(root);
+    }
+    if ((this.clientName ?? "").toLowerCase().includes("paseo")) {
+      const root = clientConnectionRoot(client);
+      if (root !== undefined) this.paseoConnectionRoots.add(root);
     }
     this.mergeClientCapabilities((params.clientCapabilities as ClientCapabilities) ?? {});
     log(

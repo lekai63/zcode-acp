@@ -241,13 +241,14 @@ export function orderThoughtVariants(variants) {
     const extra = variants.filter((t) => !THOUGHT_ORDER.includes(t));
     return [...known, ...extra].map((t) => ({ value: t, name: t }));
 }
-/** Build the ACP configOptions array (3 items: model/mode/thought).
+/** Build the ACP configOptions array (model/mode/thought).
  *  zcodeSid null = pending session — skip the backend read and use defaults;
  *  mode defaults to "yolo" (the mode session/create hardcodes) so the dropdown
  *  matches the mode indicator for a fresh session.
  *  `receiverRoot` is the clientConnectionRoot of the client the array is
  *  delivered to — the quota pseudo-option is appended only for martty
- *  connections (ADR-0021); other receivers get the spec-clean 3 options. */
+ *  connections (ADR-0021), and the `mode` option is omitted for paseo
+ *  connections (they already surface the ACP session `modes`). */
 export async function buildConfigOptions(server, zcodeSid, receiverRoot) {
     let currentProviderId = "";
     let currentModelId = DEFAULT_MODEL_ID;
@@ -336,6 +337,10 @@ export async function buildConfigOptions(server, zcodeSid, receiverRoot) {
     }
     if (!thoughtOptions)
         thoughtOptions = [...CONFIG_META.thought.options];
+    // Paseo renders the ACP session `modes` as its own Mode control and switches
+    // via session/set_mode, so the category-"mode" option is redundant there and
+    // would otherwise be rendered a second time as a setting.
+    const omitMode = receiverRoot !== undefined && server.paseoConnectionRoots.has(receiverRoot);
     const options = [
         {
             id: "model",
@@ -345,14 +350,18 @@ export async function buildConfigOptions(server, zcodeSid, receiverRoot) {
             currentValue: currentModel,
             options: modelOptions,
         },
-        {
-            id: "mode",
-            name: CONFIG_META.mode.name,
-            category: "mode",
-            type: "select",
-            currentValue: currentMode,
-            options: [...CONFIG_META.mode.options],
-        },
+        ...(omitMode
+            ? []
+            : [
+                {
+                    id: "mode",
+                    name: CONFIG_META.mode.name,
+                    category: "mode",
+                    type: "select",
+                    currentValue: currentMode,
+                    options: [...CONFIG_META.mode.options],
+                },
+            ]),
         {
             id: "thought",
             name: CONFIG_META.thought.name,
