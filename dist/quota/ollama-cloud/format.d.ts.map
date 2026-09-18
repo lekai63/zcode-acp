@@ -1,0 +1,1 @@
+{"version":3,"file":"format.d.ts","sourceRoot":"","sources":["../../../src/quota/ollama-cloud/format.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;GAWG;AAKH,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,YAAY,CAAC;AAehD,qEAAqE;AACrE,MAAM,WAAW,eAAe;IAC9B,MAAM,EAAE,MAAM,CAAC;IACf,IAAI,EAAE,MAAM,EAAE,CAAC;CAChB;AAED;;;;;;;;;GASG;AACH,wBAAgB,eAAe,CAAC,MAAM,EAAE,aAAa,EAAE,KAAK,UAAQ,GAAG,eAAe,CA0BrF"}

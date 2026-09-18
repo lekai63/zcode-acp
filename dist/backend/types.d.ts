@@ -38,6 +38,36 @@ export interface ZcodeSessionInfo {
 }
 export interface ZcodeCreateResult {
     session: ZcodeSessionInfo;
+    /**
+     * Session settings snapshot. `model.available` is the FULL registry listing
+     * (with per-model reasoning metadata) — only create/resume return it;
+     * `session/read` answers with the current model alone. See
+     * `server.modelAvailability`.
+     */
+    settings?: {
+        model?: {
+            current?: {
+                providerId?: string;
+                modelId?: string;
+            };
+            available?: Array<{
+                ref?: {
+                    providerId?: string;
+                    modelId?: string;
+                };
+                reasoning?: {
+                    defaultLevel?: string;
+                    levels?: Array<{
+                        value?: string;
+                    }>;
+                };
+            }>;
+        };
+        thoughtLevel?: {
+            current?: string;
+            defaultLevel?: string;
+        };
+    };
 }
 export interface ZcodeSessionListItem {
     sessionId: string;
@@ -50,7 +80,7 @@ export interface ZcodeSessionListItem {
 export interface ZcodeListResult {
     sessions: ZcodeSessionListItem[];
 }
-export type ZcodeEventType = "turn.started" | "model.streaming" | "tool.updated" | "turn.completed" | "turn.failed" | "session.updated" | "state.updated" | "turn.steerQueued" | "turn.steerDrained" | "turn.terminal";
+export type ZcodeEventType = "turn.started" | "model.streaming" | "tool.updated" | "turn.completed" | "turn.failed" | "session.updated" | "state.updated" | "turn.steerQueued" | "turn.steerDrained" | "turn.terminal" | "session.titleUpdated";
 export interface ZcodeEvent {
     sessionId: string;
     seq: number;

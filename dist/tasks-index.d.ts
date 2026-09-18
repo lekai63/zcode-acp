@@ -53,6 +53,14 @@ export declare function renameSessionTask(taskId: string, title: string): Promis
  * matches the shape of App-created rows.
  */
 export declare function updateSessionTitle(taskId: string, title: string, searchableText?: string): Promise<boolean>;
+/**
+ * Whether the tasks-index row marks this conversation's title as manually
+ * renamed (`title_overridden=1`, set by renameSessionTask). Read-only consult
+ * for the title listener: the bridge's in-memory rename pin is lost on
+ * restart, but the durable flag keeps a later backend `generated` title push
+ * from overriding the user's rename. False when the index or row is absent.
+ */
+export declare function isTitleOverridden(taskId: string): Promise<boolean>;
 /** One known project workspace, as recorded by the App's tasks index. */
 export interface KnownWorkspace {
     workspacePath: string;

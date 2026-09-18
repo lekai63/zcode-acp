@@ -55,12 +55,39 @@ export function loadUserConfig(env = process.env) {
         return {};
     }
     const remote = parsed["remote"];
-    if (remote === undefined)
+    if (remote === undefined && parsed["quota"] === undefined)
         return {};
-    if (!isPlainObject(remote)) {
-        warn(`config: "remote" in ${file} is not an object — ignoring the section`);
-        return {};
+    const result = {};
+    if (remote !== undefined && isPlainObject(remote)) {
+        result.remote = parseRemoteSection(remote, file);
     }
+    else if (remote !== undefined) {
+        warn(`config: "remote" in ${file} is not an object — ignoring the section`);
+    }
+    const quota = parsed["quota"];
+    if (quota !== undefined) {
+        if (!isPlainObject(quota)) {
+            warn(`config: "quota" in ${file} is not an object — ignoring the section`);
+        }
+        else {
+            const q = {};
+            for (const [jsonKey, prop] of [
+                ["ollamaApiKey", "ollamaApiKey"],
+                ["opencodeGoWorkspaceId", "opencodeGoWorkspaceId"],
+                ["opencodeGoAuthCookie", "opencodeGoAuthCookie"],
+            ]) {
+                const v = quota[jsonKey];
+                if (typeof v === "string" && v.trim())
+                    q[prop] = v.trim();
+            }
+            if (Object.keys(q).length > 0)
+                result.quota = q;
+        }
+    }
+    return result;
+}
+/** Parse the validated `remote` section object into {@link RemoteUserConfig}. */
+function parseRemoteSection(remote, file) {
     const out = {};
     if (typeof remote["enabled"] === "boolean")
         out.enabled = remote["enabled"];
@@ -106,6 +133,6 @@ export function loadUserConfig(env = process.env) {
     else if (terminal !== undefined) {
         warn(`config: remote.terminal in ${file} is not an object — ignoring`);
     }
-    return { remote: out };
+    return out;
 }
 //# sourceMappingURL=user-config.js.map

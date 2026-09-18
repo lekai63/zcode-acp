@@ -40,8 +40,18 @@ export interface RemoteUserConfig {
     bridgePort?: number;
     terminal?: TerminalPrefs;
 }
+/** The `quota` section of the user config file. */
+export interface QuotaUserConfig {
+    /** Ollama Cloud API key for the `zcode-acp quota` card (cloud.ollama.ai). */
+    ollamaApiKey?: string;
+    /** Opencode Go workspace id (`wrk_…`) — see the quota CLI docs. */
+    opencodeGoWorkspaceId?: string;
+    /** Opencode Go `auth` cookie value (`Fe26.2**…`). */
+    opencodeGoAuthCookie?: string;
+}
 export interface UserConfig {
     remote?: RemoteUserConfig;
+    quota?: QuotaUserConfig;
 }
 /** Resolve the config file path: $XDG_CONFIG_HOME/zcode-acp or ~/.config/zcode-acp. */
 export declare function userConfigPath(env?: NodeJS.ProcessEnv): string;

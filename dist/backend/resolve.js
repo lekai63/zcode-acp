@@ -118,6 +118,72 @@ function discoverZcodeBin() {
     }
     return null;
 }
+// ---------- provider-runtime env injection (3.12.3+ desktop bundles) ----------
+/**
+ * The CLI's built-in provider table. The desktop app's host resolves it as
+ * `<resources>/config/provider/zcode-builtin.json` and hands it to the CLI via
+ * `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` (verified in app.asar 3.12.3 — the env
+ * skips the CLI's own file lookup entirely). That lookup only knows the
+ * npm/dev layouts (`<entryDir>/provider/` and a five-up `config/` for the
+ * monorepo tree), so a .app-bundled `zcode.cjs` launched bare exits during
+ * boot with `无法定位 CLI ZCode Built-in Provider Config` (observed 2026-09:
+ * exit 1 in <1s, every bridge backend spawn dead until the CLI's
+ * `~zcode/v2/runtime/provider` sync happens to run — which itself needs a
+ * valid source, so post-update machines sit dead).
+ */
+const PROVIDER_CONFIG_NAME = "zcode-builtin.json";
+export const BUILTIN_PROVIDER_ENV = "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE";
+export const PERSONAL_PROVIDER_ENV = "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE";
+/**
+ * Env vars pointing the CLI at its provider tables, mirroring the desktop
+ * host's own injection. Locates the builtin file next to the resolved CLI
+ * entry (sibling `provider/` — npm/dev layout — or `../config/provider/` —
+ * the .app bundle layout) and returns BOTH
+ * `{ZCODE_BUILTIN_PROVIDER_CONFIG_FILE, ZCODE_PERSONAL_PROVIDER_CONFIG_FILE}`;
+ * `{}` when the entry is not a JS file, is missing, or carries no provider
+ * config anywhere (old CLIs, PATH installs) — those boot without one.
+ *
+ * BOTH vars are required: the CLI's provider bootstrap uses the injected
+ * builtin path VERBATIM only when the personal var is set too — with the
+ * builtin alone it re-syncs the table into a version-keyed runtime copy
+ * (`~/.zcode/v2/runtime/provider/<plat>/<version>/<endpoint dir>/zcode-builtin.json`)
+ * and rewires
+ * its configRevision to THAT copy's path. The account-config push's
+ * `basedOnZcodeBuiltinRevision` hashes the injected path, so any rewire
+ * silently voids the push and every account model answers "Provider
+ * Registry 中不存在 Model" (observed 2026-09: one terminal env took the
+ * re-sync path deterministically while another never did). The personal
+ * value is the CLI's own default location, just made explicit to unlock the
+ * verbatim branch.
+ *
+ * The derived value deliberately OVERRIDES any inherited ambient env: the
+ * host injects version-keyed runtime paths
+ * (`…/runtime/provider/<plat>/<appVersion>/endpoint-<hash>/zcode-builtin.json`)
+ * that go stale or vanish across app updates, while the derived path always
+ * matches the entry about to be launched. Only a {} result (no adjacent
+ * config) leaves the ambient value untouched — for a non-bundled CLI that
+ * ambient value is the best hint.
+ */
+export function builtinProviderEnv(entryArg) {
+    const entry = entryArg ?? process.env.ZCODE_BIN ?? discoverZcodeBin();
+    if (!entry || !/\.(cjs|mjs|js)$/.test(entry))
+        return {};
+    const abs = path.resolve(entry);
+    if (!existsSync(abs))
+        return {};
+    const dir = path.dirname(abs);
+    const candidates = [
+        path.join(dir, "provider", PROVIDER_CONFIG_NAME),
+        path.join(dir, "..", "config", "provider", PROVIDER_CONFIG_NAME),
+    ];
+    const found = candidates.find((c) => existsSync(c));
+    if (!found)
+        return {};
+    const personal = path.join(os.homedir(), ".zcode", "v2", "provider_config.json");
+    return existsSync(personal)
+        ? { [BUILTIN_PROVIDER_ENV]: found, [PERSONAL_PROVIDER_ENV]: personal }
+        : { [BUILTIN_PROVIDER_ENV]: found };
+}
 /**
  * Happy Eyeballs (`autoSelectFamily`, on by default since Node 20.13) gives
  * each connect attempt a 250ms budget. On a network with no IPv6 route where

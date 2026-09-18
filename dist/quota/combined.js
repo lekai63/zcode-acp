@@ -2,20 +2,23 @@
  * Combined multi-provider quota — the orchestration layer used by the
  * `zcode-acp quota` CLI when no provider subcommand is given (default mode).
  *
- * Queries GLM Coding Plan and Opencode Go in parallel and renders a single
- * merged card with one section per provider. The `/quota` slash command does
- * NOT use this — it stays on the single-provider GLM {@link formatQuota}.
+ * Queries GLM Coding Plan, Opencode Go, and Ollama Cloud in parallel and
+ * renders a single merged card with one section per provider. The `/quota`
+ * slash command does NOT use this — it stays on the single-provider GLM
+ * {@link formatQuota}.
  *
  * Design notes:
- *   - `Promise.all` so a slow Opencode Go scrape doesn't delay the GLM card.
- *   - A `not_configured` Opencode Go result is silently dropped (no header,
- *     no error line) in `all` mode, so GLM-only users see no noise. In `go`
- *     mode it surfaces as a help line because the user explicitly asked.
+ *   - `Promise.all` so a slow provider scrape doesn't delay the others.
+ *   - A `not_configured` non-GLM result is silently dropped (no header,
+ *     no error line) in `all` mode, so GLM-only users see no noise. In that
+ *     provider's own mode it surfaces as a help line because the user
+ *     explicitly asked.
  *   - The divider width is computed from the widest body line so the frame
  *     stays balanced regardless of which windows/counts are present.
  */
 import { renderGlmSection } from "./format.js";
 import { queryQuota } from "./index.js";
+import { formatOcSection, queryOcUsage } from "./ollama-cloud/index.js";
 import { formatGoSection, queryGoUsage } from "./opencode-go/index.js";
 /**
  * Which Opencode Go windows to render. All three (rolling + weekly + monthly)
@@ -38,28 +41,37 @@ export function defaultGoWindows(provider) {
  * always resolves.
  */
 export async function queryCombined(provider) {
-    // For `glm`-only we skip the Go fetch entirely; for `go`-only we skip GLM.
-    // Skipping is cheaper and avoids touching Go credentials the user may not
-    // have set. We still return both fields so the formatter's shape is uniform.
-    const tasks = provider === "glm"
-        ? [queryQuota(), Promise.resolve({ kind: "not_configured" })]
-        : provider === "go"
-            ? [Promise.resolve({ kind: "unavailable" }), queryGoUsage()]
-            : [queryQuota(), queryGoUsage()];
-    const [glm, go] = await Promise.all(tasks);
-    return { glm, go };
+    // Single-provider modes skip the other fetches entirely. Skipping is
+    // cheaper and avoids touching credentials the user may not have set. We
+    // still return all fields so the formatter's shape is uniform.
+    const NONE_GLM = { kind: "unavailable" };
+    const NONE = { kind: "not_configured" };
+    const tasks = {
+        glm: provider === "go" || provider === "oc" ? Promise.resolve(NONE_GLM) : queryQuota(),
+        go: provider === "glm" || provider === "oc"
+            ? Promise.resolve(NONE)
+            : queryGoUsage(),
+        oc: provider === "glm" || provider === "go"
+            ? Promise.resolve(NONE)
+            : queryOcUsage(),
+    };
+    const [glm, go, oc] = await Promise.all([tasks.glm, tasks.go, tasks.oc]);
+    return { glm, go, oc };
 }
 /**
- * Decide whether the Go section should appear at all in `all` mode.
+ * Decide whether a non-GLM section should appear at all in `all` mode.
  *
  * `not_configured` is silently dropped (the user hasn't set credentials and
- * didn't explicitly ask for Go). All other kinds — including `unavailable`
- * and `auth_error` — render so the user sees that something is wrong.
+ * didn't explicitly ask for that provider). All other kinds — including
+ * `unavailable` and `auth_error` — render so the user sees that something is
+ * wrong.
  */
-function shouldShowGo(provider, go) {
-    if (provider === "glm")
+function shouldShowSection(result, provider, 
+/** The single-provider token that explicitly selects this section. */
+own) {
+    if (provider !== "all" && provider !== own)
         return false;
-    if (go.kind === "not_configured" && provider === "all")
+    if (result.kind === "not_configured" && provider === "all")
         return false;
     return true;
 }
@@ -109,7 +121,7 @@ function renderCombinedLines(combined, provider, glmOpts, goWindows, color = fal
 /** Optional refresh countdown rendered on the separator line after the
  *  first section (e.g. `refresh in 29s`). */
 refreshSuffix) {
-    const { glm, go } = combined;
+    const { glm, go, oc } = combined;
     const sep = separatorLine(refreshSuffix);
     // Fold the color flag into the GLM FormatOptions so it reaches renderGlmSection
     // alongside detail/compact without each caller having to set it.
@@ -128,33 +140,46 @@ refreshSuffix) {
         const lines = [section.header, ...section.body];
         return sep ? [...lines, sep] : lines;
     }
+    // Single-provider Ollama Cloud: header + body, no banner/divider.
+    if (provider === "oc") {
+        const section = formatOcSection(oc, color);
+        const lines = [section.header, ...section.body];
+        return sep ? [...lines, sep] : lines;
+    }
     // Combined `all` mode. GLM renders full (MCP on its own line) — the layout
     // is short enough now that compact mode isn't worth the lost detail.
     const glmSection = renderGlmSection(glm, glmOptsColor);
-    const showGo = shouldShowGo("all", go);
+    const showGo = shouldShowSection(go, provider, "go");
     const goSection = showGo
         ? formatGoSection(go, goWindows ?? defaultGoWindows("all"), Date.now(), color)
         : null;
+    const ocSection = shouldShowSection(oc, provider, "oc") ? formatOcSection(oc, color) : null;
     const hasGlm = glmSection.body.length > 0;
     const hasGo = !!goSection && goSection.body.length > 0;
+    const hasOc = !!ocSection && ocSection.body.length > 0;
     // The separator line always follows the FIRST rendered section, so its row
-    // is fixed whether or not a second section appears.
+    // is fixed regardless of how many sections follow.
     const sections = [];
     if (hasGlm)
         sections.push([` ${glmSection.header}`, ...glmSection.body]);
     if (hasGo)
         sections.push([` ${goSection.header}`, ...goSection.body]);
+    if (hasOc)
+        sections.push([` ${ocSection.header}`, ...ocSection.body]);
     if (sections.length === 0) {
         return ["  ⚠ no usage data available"];
     }
     // No banner or top divider — the section headers themselves identify each
     // provider, and an extra banner line adds noise without information. The
-    // refresh countdown sits on the separator row between sections (or after
-    // the only section), right-aligned.
+    // refresh countdown sits on the separator row after the FIRST section
+    // (right-aligned); later separators stay blank so the countdown is not
+    // duplicated across rows.
     const body = [];
     sections.forEach((sec, i) => {
-        if (i > 0)
+        if (i === 1)
             body.push(sep);
+        if (i > 1)
+            body.push("");
         body.push(...sec);
     });
     // If there's only one section, the separator still trails it so the refresh

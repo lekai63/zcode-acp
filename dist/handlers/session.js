@@ -21,6 +21,7 @@ import { buildModes, buildConfigOptions, DEFAULT_MODEL_ID, DEFAULT_PROVIDER_ID, 
 import { currentModelCached, emitInitialUsage } from "../config/model-cache.js";
 import { forceRefreshQuota, scheduleQuotaDockBackstop, startQuotaRefresher, } from "../quota/live.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
+import { pushAccountProviderConfig } from "../config/account-provider.js";
 import { applyModelSwitch, buildResumeRuntimeModel } from "../config/runtime-model.js";
 import { messages } from "../i18n.js";
 import { lookupLazySession, recordMaterializedSession, rememberLazySession, } from "../lazy-sessions.js";
@@ -105,6 +106,14 @@ function workspaceFromResumeResult(result) {
  */
 async function syncProviderRegistry(server, cwd) {
     try {
+        // Account-plan providers first: 3.12+ app-servers build their registry from
+        // the bundled table + personal config + an ACCOUNT snapshot the desktop
+        // host pushes (`provider/updateAccountConfig`). Headless launches have no
+        // host, so every `account:*` provider stays entitled:false and the GLM
+        // models the user's config selects never reach `settings.model.available`
+        // (verified 2026-09 — switches then fail with "Provider Registry 中不存在
+        // Model"). Pushing the snapshot restores desktop parity. Best-effort.
+        await pushAccountProviderConfig(server.ensureBackend(), () => server.nextId());
         const registry = buildProviderRegistry();
         if (registry.providers.length === 0) {
             // Every configured provider lacks models (or none are configured). The
@@ -119,7 +128,14 @@ async function syncProviderRegistry(server, cwd) {
             .ensureBackend()
             .request(server.nextId(), "workspace/updateProviderRegistry", { workspace: workspaceFor(cwd), registry }, 10000);
         if (resp.error) {
-            warn(`provider-registry: sync failed: ${resp.error.message}`);
+            // 3.12+ removed the method (the registry is built from the bundled table,
+            // personal config, and the account snapshot) — a no-op, not a failure.
+            if (resp.error.code === -32601) {
+                log("provider-registry: backend has no workspace/updateProviderRegistry (3.12+)");
+            }
+            else {
+                warn(`provider-registry: sync failed: ${resp.error.message}`);
+            }
             return;
         }
         log("provider-registry: synced to backend");
@@ -484,6 +500,15 @@ export async function ensureRealSession(server, acpSid) {
         const sid = session.sessionId;
         if (!sid)
             throw new Error("zcode create returned no sessionId");
+        const availability = (result.settings ?? {}).model;
+        const avail = availability?.available ?? [];
+        if (avail.length > 0) {
+            server.modelAvailability.set(sid, avail.map((a) => ({
+                providerId: a.ref?.providerId,
+                modelId: a.ref?.modelId,
+                defaultLevel: a.reasoning?.defaultLevel ?? a.reasoning?.levels?.[0]?.value,
+            })));
+        }
         server.pendingSessions.delete(acpSid);
         server.registerSession(acpSid, sid);
         // With both ZCODE_PROVIDER and ZCODE_MODEL set, the session is pinned to
@@ -845,6 +870,9 @@ export async function resumeIntoSession(server, cx, acpSid, zcodeTarget) {
     // The adopted session's stored title wins over the placeholder's first-
     // prompt auto-title.
     server.titleEligibleSessions.delete(acpSid);
+    // Same for the user-rename pin: it belonged to the discarded placeholder
+    // thread, not the adopted conversation.
+    server.titleUserSetBy.delete(acpSid);
     const cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
     // Settled history when a resume flight ran (performer OR joiner — the
     // flight settles hydration before resolving); the read below then uses the
@@ -1321,7 +1349,21 @@ export async function runOneTurn(server, opts) {
                     // resume path); the cold-start form is transient and retries below.
                     throw new Error(`zcode send failed: ${sendResp.error.message ?? ""}`);
                 }
-                const budget = isBusy ? SEND_RETRY_TIMEOUT_MS : WARMUP_RETRY_TIMEOUT_MS;
+                // A background NOTIFICATION turn (the model summarising a finished
+                // background task) holds the prompt lock and easily outlives the normal
+                // busy budget — it is a real model turn, and the send WILL be accepted
+                // once it drains (observed live 2026-09-18: -32010 "A prompt is already
+                // running for this session" while the notify turn ran). Extend the
+                // budget instead of failing the user's prompt. The window is bounded by
+                // freshness: if the listener never saw the notification turn's terminal
+                // event (dropped stream), the stale marker must not extend busy waits
+                // forever — a marker older than 10 minutes is ignored.
+                const NOTIFY_TURN_BUSY_TIMEOUT_MS = 180_000;
+                const NOTIFY_TURN_STALE_MS = 600_000;
+                const notifySince = server.notifyTurnActiveSince.get(zcodeSid);
+                const notifyActive = notifySince !== undefined && Date.now() - notifySince < NOTIFY_TURN_STALE_MS;
+                const busyBudget = notifyActive ? NOTIFY_TURN_BUSY_TIMEOUT_MS : SEND_RETRY_TIMEOUT_MS;
+                const budget = isBusy ? busyBudget : WARMUP_RETRY_TIMEOUT_MS;
                 if (Date.now() - sendT0 > budget) {
                     throw new Error(`zcode send failed: ${isBusy ? "backend still busy" : "send keeps being rejected"} after ${Math.round(budget / 1000)}s (${sendResp.error.message ?? ""})`);
                 }
@@ -1496,6 +1538,11 @@ async function runPrompt(server, params, cx, requestId, continuationRound = fals
     // Materialize a lazy session/new placeholder on first use. Placed after the
     // empty-prompt check so an invalid request doesn't create a backend session.
     const zcodeSid = await ensureRealSession(server, params.sessionId);
+    // Re-arm the session's out-of-band listeners (background tasks, backend
+    // titles): a mid-session backend respawn (sandbox flip, dynamic allow
+    // batches, dead-reader recovery) replaces the instance the listeners were
+    // registered on — ensureBackgroundListener re-registers on the current one.
+    server.ensureBackgroundListener(zcodeSid);
     // Slash-command interception: dispatches directly to ZCode methods and
     // returns end_turn without entering the turn loop. Known passthrough
     // commands and unknown /x both return null for the normal turn loop.

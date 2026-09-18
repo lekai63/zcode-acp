@@ -76,7 +76,11 @@ export class BackgroundTaskListener {
                 const turnId = event.payload?.["turnId"] ?? "";
                 if (inputSource === "background_task") {
                     this.activeNotifyTurnId = turnId || null;
+                    // Publish the window: the prompt path extends its send busy-retry
+                    // budget while a notification turn (a real model turn) holds the
+                    // prompt lock (server.notifyTurnActiveSince, see session.ts).
                     if (this.activeNotifyTurnId) {
+                        this.server.notifyTurnActiveSince.set(this.zcodeSid, Date.now());
                         log(`  [bg] background notification turn started (${turnId.slice(-8)})`);
                     }
                 }
@@ -96,6 +100,7 @@ export class BackgroundTaskListener {
                 if (event.type === "turn.completed" || event.type === "turn.failed") {
                     log(`  [bg] background notification turn ended (${event.type})`);
                     this.activeNotifyTurnId = null;
+                    this.server.notifyTurnActiveSince.delete(this.zcodeSid);
                     // Reset the result messageId so the NEXT background task in this
                     // session gets its own — otherwise the editor would merge/overwrite
                     // distinct tasks' outputs under one shared messageId.

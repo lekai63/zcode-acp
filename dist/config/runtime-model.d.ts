@@ -52,15 +52,19 @@ export declare function buildResumeRuntimeModel(): unknown | null;
  * `value` is the configOption value: either `"providerId\modelId"` (encoded) or
  * a legacy plain modelId (resolved to the first enabled builtin provider).
  *
- * Sends BOTH a `model` ref (the target) AND a `runtimeModel` (the full provider
- * definition). The runtimeModel lets the backend register the provider into its
- * workspace catalog (so even third-party / non-default models are recognised),
- * while `model` names the selection. `persistAsWorkspaceLastUsed:false` keeps
- * this a runtime-only change. Invalidates the model cache on success.
+ * 3.12+ schema (verified 2026-09 against the bare app-server): the body is
+ * `{sessionId, model: {providerId, modelId, options?}, persistAsWorkspaceLastUsed}`
+ * — STRICT. The old `runtimeModel` overlay is gone (`Unrecognized key`), and
+ * the object form REQUIRES `options.reasoningLevel` for models that declare
+ * levels ("Reasoning level is required for <p>/<m>"; a bare string form skips
+ * that check but cannot carry the level). We therefore send the target model's
+ * own default level, read from the account/registry entry when we have it, and
+ * fall back to omitting `options` for level-less models.
  *
- * NOTE: the older `session/updateRuntimeModelConfig` path returns `changed:false`
- * on current backends without applying — `session/setModel` is the working
- * protocol since the backend model-management refactor.
+ * Provider ids are translated to the registry's own spelling: config.json says
+ * `builtin:bigmodel-coding-plan` while the registry exposes
+ * `account:bigmodel-individual-coding-plan` (see account-provider.ts). An
+ * untranslated id fails with "Provider Registry 中不存在 Model".
  */
 export declare function applyModelSwitch(server: ZcodeAcpServer, zcodeSid: string, value: string): Promise<boolean>;
 /** Invalidate the session-level model cache after a switch. */

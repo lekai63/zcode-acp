@@ -63,7 +63,11 @@ export declare function providerSelectable(pid: string, p: ProviderEntry | undef
  * Collect models from config.json for the dropdown.
  */
 export declare function loadAllModels(): ModelRef[];
-/** Look up a provider entry by id (any provider, not just enabled). */
+/** Look up a provider entry by id (any provider, not just enabled).
+ *
+ *  3.12+ registries spell coding-plan providers `account:<family>-<plan>` while
+ *  config.json keeps the legacy `builtin:<family>-<plan>` — normalize before
+ *  lookup so both spellings resolve. */
 export declare function findProviderConfig(providerId: string): ProviderEntry | null;
 /** Read the context-window size for a provider+model from config.json. */
 export declare function modelContextWindow(providerId: string, modelId: string): number;

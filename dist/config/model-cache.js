@@ -62,11 +62,12 @@ export async function emitInitialUsage(server, cx, acpSid, zcodeSid, differ) {
         const used = proj.contextUsed || proj.totalTokenCount || 0;
         if (!used)
             return; // resume before any turn: skip to avoid showing 0.
-        let size = proj.contextWindow ?? 0;
-        if (!size) {
-            const { providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid));
-            size = modelContextWindow(providerId, modelId);
-        }
+        // Configured limit wins over the projection's contextWindow — the
+        // projection seeds a hardcoded 200K default for models without registry
+        // metadata, config.json is the explicit per-model truth (same precedence
+        // as dispatchUsageDelta, so the gauge never flip-flops between sources).
+        const { providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid));
+        const size = modelContextWindow(providerId, modelId) || (proj.contextWindow ?? 0);
         await dispatchEvent(server, cx, acpSid, { kind: "UsageDelta", used, size }, `init_${zcodeSid.slice(0, 8)}`);
         differ?.setLastUsage(used);
     }

@@ -313,6 +313,19 @@ export declare class ZcodeAcpServer {
     /** Per-session model cache for configOptions model dropdown. */
     readonly modelCache: Map<string, string>;
     /**
+     * Per-session (zcodeSid) FULL model-availability list, captured from the
+     * `session/create` snapshot (`settings.model.available`). Only create/resume
+     * return the complete list with authoritative `reasoning.defaultLevel` —
+     * `session/read` answers `modelAvailability:"current"` (just the active
+     * model). Model switches need a target's default reasoning level, so this
+     * cache is the lookup; an entry that declares no levels simply has none.
+     */
+    readonly modelAvailability: Map<string, {
+        providerId?: string;
+        modelId?: string;
+        defaultLevel?: string;
+    }[]>;
+    /**
      * Per-session (zcodeSid) background-task listeners. Registered once when a
      * session is created/resumed/loaded and lives across prompts, forwarding
      * background task status + result notifications to the client outside of
@@ -320,6 +333,31 @@ export declare class ZcodeAcpServer {
      * (backend.listeners is now a Set per session).
      */
     readonly backgroundListeners: Map<string, BackgroundTaskListener>;
+    /**
+     * Backend instance each session's out-of-band listeners were registered on.
+     * The backend can be REPLACED mid-session (sandbox arm-flip, dynamic allow
+     * batches, dead-reader recovery) and listeners are per-instance — when this
+     * map's entry differs from the current backend, ensureBackgroundListener
+     * re-registers (also called from the prompt path so a respawn heals on the
+     * next turn, not just on resume/load).
+     */
+    readonly backgroundListenerBackend: Map<string, ZcodeBackend>;
+    /**
+     * Sessions (zcodeSid) whose background NOTIFICATION turn (the model
+     * summarising a finished background task) is currently running, → start
+     * time. Maintained by BackgroundTaskListener; read by the prompt path to
+     * extend the send busy-retry budget — a notification turn is a real model
+     * turn and easily outlives the normal 30s busy window, after which the
+     * user's prompt would fail outright (#194-adjacent UX).
+     */
+    readonly notifyTurnActiveSince: Map<string, number>;
+    /**
+     * Sessions (acpSid) whose title was set by MANUAL user intent (the remote
+     * rename endpoint, or a `session.titleUpdated` push with source "custom"
+     * from another surface). The backend's later `generated` title pushes must
+     * not override these (SessionTitleListener).
+     */
+    readonly titleUserSetBy: Set<string>;
     /**
      * Per-Bash-callId stdout snapshot already streamed via terminal_output. Used
      * by dispatchTerminalUpdate for two dedup guards:

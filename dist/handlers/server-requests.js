@@ -20,6 +20,7 @@
  * the re-send joins the existing first-response-wins race.
  */
 import { acpPermissionResponseToExitPlanMode, acpPermissionResponseToZcode, buildAskUserAcpParams, buildAskUserElicitationForm, buildPlanApprovalElicitationForm, exitPlanModeToAcpPermission, isAskUserQuestion, isExitPlanMode, isPermissionRequest, parseAskUserElicitationResponse, parseAskUserResponse, parsePlanApprovalElicitationResponse, splitAskUserQuestions, zcodePermissionToAcp, } from "../interaction/adapter.js";
+import { codingPlanRequestAuthFor } from "../config/account-provider.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
 import { messages } from "../i18n.js";
 import { clientConnectionRoot, log, warn } from "../utils.js";
@@ -273,6 +274,28 @@ async function handleOne(server, backend, cx, acpSid, req, pending, turn) {
     // fell back to client signing with the provider's OAuth JWT, dying with the
     // misleading "must contain one separator" invalid-config error (#123).
     if (isProviderRuntimeHeadersRequest(method)) {
+        // Individual coding-plan models: serve the plan's API key straight from
+        // config.json (the same key the pre-3.12 builtin: provider used). The
+        // backend asks before EVERY model request on a zhipu-account provider —
+        // declining here turns into a -32031 retry loop on every GLM turn
+        // (observed 2026-09-17: switch stuck, every send died with "unknown").
+        const sel = params
+            .modelSelection?.providerId;
+        const requestAuth = codingPlanRequestAuthFor(sel ?? params.providerId);
+        if (requestAuth) {
+            log("  provider runtime headers: serving the coding-plan API key (config.json)");
+            sendZcodeReply(backend, zcodeReqId, { headersApplied: true, requestAuth });
+            return;
+        }
+        // Start Plan providers (zcode-plan endpoints) ask their host to solve an
+        // Aliyun captcha and inject X-Aliyun-Captcha-Verify-* headers before every
+        // model request; the desktop renderer does this from a browser environment.
+        // The headless bridge has neither a browser nor the captcha credential, so
+        // the only honest answer is headersApplied:false — the backend then fails
+        // with its -32031 error carrying our message. Without this, the request
+        // fell through to the generic unsupported-request error and the backend
+        // fell back to client signing with the provider's OAuth JWT, dying with the
+        // misleading "must contain one separator" invalid-config error (#123).
         warn("  ⚠ provider runtime headers requested (Start Plan captcha session); " +
             "the headless bridge cannot provide it — declining");
         sendZcodeReply(backend, zcodeReqId, {

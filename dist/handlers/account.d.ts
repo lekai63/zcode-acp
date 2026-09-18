@@ -8,12 +8,16 @@
  *
  * The response mirrors the CLI card's data model so clients can reproduce it
  * exactly: one GLM section (plan level + per-window items with per-model
- * details) and one Opencode Go section (rolling/weekly/monthly windows, the
- * relative reset countdown converted to an absolute timestamp). Provider
- * failures are reported per-section as `kind` strings rather than throwing —
- * the client renders the same status line the CLI would (a `not_configured`
- * Go section is simply omitted, matching the CLI).
+ * details), one Opencode Go section (rolling/weekly/monthly windows, the
+ * relative reset countdown converted to an absolute timestamp), and one
+ * Ollama Cloud section (session/weekly/monthly fractions as percents, with
+ * the derived reset moments when available — the API itself returns none).
+ * Provider failures are reported per-section as
+ * `kind` strings rather than throwing — the client renders the same status
+ * line the CLI would (a `not_configured` section is simply omitted, matching
+ * the CLI).
  */
+import type { OcQueryResult } from "../quota/ollama-cloud/types.js";
 import type { GoQueryResult, GoWindowKey } from "../quota/opencode-go/types.js";
 import type { QuotaItem, QuotaResult } from "../quota/types.js";
 /** GLM section — `items` present only on success. */
@@ -34,10 +38,27 @@ export interface GoUsageStats {
     kind: GoQueryResult["kind"];
     windows?: GoWindowEntry[];
 }
+/**
+ * One Ollama Cloud window with the derived reset moment (epoch ms) when
+ * available — the API returns no timestamps, so resets are computed at query
+ * time (window anchoring, or /api/me's billing period for monthly).
+ */
+export interface OcWindowEntry {
+    key: "session" | "weekly" | "monthly";
+    label: string;
+    usagePercent: number;
+    resetsAt?: number;
+}
+/** Ollama Cloud section — `windows` present only on success. */
+export interface OcUsageStats {
+    kind: OcQueryResult["kind"];
+    windows?: OcWindowEntry[];
+}
 export interface UsageStatsResult {
     glm: GlmUsageStats;
     opencode: GoUsageStats;
+    ollama: OcUsageStats;
 }
-/** `account/usage_stats` handler — both providers, queried in parallel. */
+/** `account/usage_stats` handler — all providers, queried in parallel. */
 export declare function accountUsageStats(): Promise<UsageStatsResult>;
 //# sourceMappingURL=account.d.ts.map

@@ -11,6 +11,7 @@
  */
 import { readFileSync } from "node:fs";
 import { clientConnectionRoot, CONFIG_DISPATCH, CONFIG_META, log, warn, ZCODE_CREDS_PATH, } from "../utils.js";
+import { configProviderIdFor } from "./account-provider.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 /** Read the config.json contents (UTF-8). Throws on read/parse failure. */
 function readConfig() {
@@ -123,11 +124,15 @@ export function loadAllModels() {
         ];
     }
 }
-/** Look up a provider entry by id (any provider, not just enabled). */
+/** Look up a provider entry by id (any provider, not just enabled).
+ *
+ *  3.12+ registries spell coding-plan providers `account:<family>-<plan>` while
+ *  config.json keeps the legacy `builtin:<family>-<plan>` — normalize before
+ *  lookup so both spellings resolve. */
 export function findProviderConfig(providerId) {
     try {
         const cfg = readConfig();
-        return cfg.provider?.[providerId] ?? null;
+        return cfg.provider?.[providerId] ?? cfg.provider?.[configProviderIdFor(providerId)] ?? null;
     }
     catch {
         return null;
@@ -137,9 +142,9 @@ export function findProviderConfig(providerId) {
 export function modelContextWindow(providerId, modelId) {
     try {
         const cfg = readConfig();
-        const models = cfg.provider?.[providerId]?.models ?? {};
-        const entry = models[modelId];
-        return entry?.limit?.context ?? 0;
+        const entry = cfg.provider?.[configProviderIdFor(providerId)];
+        const models = entry?.models ?? {};
+        return models[modelId]?.limit?.context ?? 0;
     }
     catch {
         return 0;
@@ -198,6 +203,18 @@ function buildModelSelectOptions(models) {
  * builtin provider. A value with `\` is the current provider+model encoding.
  */
 export function parseModelValue(value) {
+    // New-format (3.12+) agent-definition spelling: `custom:<urlencoded
+    // providerId>:<modelId>` — e.g. custom:account%3Abigmodel-individual-coding-plan:GLM-5.3
+    // (the provider id's colons are percent-encoded, so `[^:]+` splits cleanly).
+    const custom = /^custom:([^:]+):(.+)$/.exec(value);
+    if (custom) {
+        try {
+            return { providerId: decodeURIComponent(custom[1]), modelId: custom[2] };
+        }
+        catch {
+            // malformed encoding — fall through to the legacy spellings
+        }
+    }
     const idx = value.indexOf("\\");
     if (idx < 0) {
         // Builtin plain modelId — resolve to the first enabled builtin provider
@@ -316,10 +333,13 @@ export async function buildConfigOptions(server, zcodeSid, receiverRoot) {
             currentMode = modeSet.current ?? currentMode;
             const modelSet = settings.model ?? {};
             // settings.model.current is { providerId, modelId, variant? } — read BOTH so
-            // we can disambiguate same-named models across providers.
+            // we can disambiguate same-named models across providers. Normalize the
+            // provider spelling (3.12+ registries answer `account:<family>-<plan>`;
+            // config.json and the dropdown use `builtin:<family>-<plan>`) so the
+            // current value matches a dropdown entry instead of duplicating it.
             const cur = modelSet.current ?? {};
             if (cur.providerId)
-                currentProviderId = cur.providerId;
+                currentProviderId = configProviderIdFor(cur.providerId);
             if (cur.modelId)
                 currentModelId = cur.modelId;
             const tlSet = settings.thoughtLevel ?? {};

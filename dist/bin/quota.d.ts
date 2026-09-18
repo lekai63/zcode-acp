@@ -27,7 +27,7 @@ export interface CliOptions {
     /** True when the user wants per-model MCP detail sub-lines shown. */
     detail: boolean;
     help: boolean;
-    /** Which provider(s) to query — first positional arg (`glm`/`go`), else `all`. */
+    /** Which provider(s) to query — first positional arg (`glm`/`go`/`oc`), else `all`. */
     provider: Provider;
     /** True when the user explicitly asked for the plain monochrome layout. */
     plain: boolean;

@@ -43,15 +43,30 @@ import { readCodeFingerprint } from "./code-fingerprint.js";
 import { remoteEnabledLive, remoteTerminalPrefs } from "./config.js";
 import { accountUsageStats } from "../handlers/account.js";
 import { BOOT_RESUME_TRIGGER } from "../handlers/session.js";
-import { composeQuotaDock, formatGoDockSegment, formatQuotaDock } from "../quota/format.js";
+import { composeQuotaDock, formatGoDockSegment, formatOcDockSegment, formatQuotaDock, } from "../quota/format.js";
 import { queryQuota } from "../quota/index.js";
+import { queryOcUsage } from "../quota/ollama-cloud/index.js";
 import { queryGoUsage } from "../quota/opencode-go/index.js";
 import { listKnownWorkspaces } from "../tasks-index.js";
 const HEARTBEAT_TIMEOUT_MS = 30_000;
 const IDLE_EXIT_MS = 10 * 60_000;
 const PING_INTERVAL_MS = 30_000;
-/** Per-instance TCP probe timeout for /api/instances?probe=1. */
-const PROBE_TIMEOUT_MS = 500;
+/**
+ * Per-instance TCP probe timeout for /api/instances?probe=1. Generous on
+ * purpose: the bridge is single-threaded and a busy event loop (large payload
+ * parse, sync fs) can delay accept() well past a tight timeout while the
+ * process is perfectly healthy.
+ */
+const PROBE_TIMEOUT_MS = 2_000;
+/**
+ * An instance must be probe-unreachable for at least this long before the
+ * probe prunes it. One failed probe only marks unhealthySince — the next
+ * ?probe=1 (clients poll every 3–5s) prunes only if the mark is older than
+ * this. A hard-killed bridge still disappears in ~2 polls instead of waiting
+ * out the 30s heartbeat TTL; a momentary event-loop stall no longer evicts a
+ * live instance and kicks attached clients ("Instance went away").
+ */
+const PROBE_GRACE_MS = 8_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 /** Constant-time token compare (hash both to equal length first). */
 function tokenEquals(a, b) {
@@ -512,9 +527,14 @@ function getQuotaDock() {
     }
     return Promise.all([
         queryQuota().then(formatQuotaDock),
-        queryGoUsage().then(formatGoDockSegment).catch(() => null),
-    ]).then(([glm, go]) => {
-        dockCache = { formatted: composeQuotaDock(glm, go), at: Date.now() };
+        queryGoUsage()
+            .then(formatGoDockSegment)
+            .catch(() => null),
+        queryOcUsage()
+            .then(formatOcDockSegment)
+            .catch(() => null),
+    ]).then(([glm, go, oc]) => {
+        dockCache = { formatted: composeQuotaDock(glm, go, oc), at: Date.now() };
         return { formatted: dockCache.formatted, fetchedAt: dockCache.at };
     });
 }
@@ -707,7 +727,7 @@ async function diskCodeIsNewer(paths, startedAt, runningFingerprint) {
  * EADDRINUSE when another hub already owns the port).
  */
 export function startHub(options) {
-    const { port, host, token, heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS, idleExitMs = IDLE_EXIT_MS, pingIntervalMs = PING_INTERVAL_MS, tuiRegisterTimeoutMs = TUI_REGISTER_TIMEOUT_MS, onIdleExit, onRestart, codePaths = defaultCodePaths(), projectsDbPath, stayAliveCheck = () => remoteEnabledLive(), spawnServe = defaultSpawnServe, terminalLaunches, staleVoteCooldownMs = STALE_VOTE_COOLDOWN_MS, } = options;
+    const { port, host, token, heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS, probeGraceMs = PROBE_GRACE_MS, idleExitMs = IDLE_EXIT_MS, pingIntervalMs = PING_INTERVAL_MS, tuiRegisterTimeoutMs = TUI_REGISTER_TIMEOUT_MS, onIdleExit, onRestart, codePaths = defaultCodePaths(), projectsDbPath, stayAliveCheck = () => remoteEnabledLive(), spawnServe = defaultSpawnServe, terminalLaunches, staleVoteCooldownMs = STALE_VOTE_COOLDOWN_MS, } = options;
     /** Frozen at hub start — the anchor the /api/upgrade signals compare to. */
     const startedAt = Date.now();
     /**
@@ -1117,20 +1137,38 @@ export function startHub(options) {
                 return;
             }
             // On-demand liveness probe (?probe=1): verify every registered bridge's
-            // loopback port and prune the unreachable ones before answering, so a
-            // client refresh gets an honest list instead of waiting out the
-            // heartbeat TTL (hard-killed bridges never unregister).
+            // loopback port before answering so a client refresh gets an honest
+            // list without waiting out the heartbeat TTL (hard-killed bridges never
+            // unregister). A single failed probe does NOT prune — a busy bridge's
+            // event loop can stall past the connect timeout while fully alive, and
+            // evicting it kicks every attached client. The first failure marks
+            // unhealthySince; only a probe failing after probeGraceMs of continuous
+            // unreachability prunes. A successful probe or a re-register (heartbeat)
+            // clears the mark.
             if (["1", "true"].includes((url.searchParams.get("probe") ?? "").toLowerCase())) {
+                const now = Date.now();
                 const probes = await Promise.all(Array.from(instances.entries(), async ([id, entry]) => ({
                     id,
                     ok: await portOpen(entry.port, PROBE_TIMEOUT_MS),
                 })));
                 for (const { id, ok } of probes) {
-                    if (!ok) {
-                        instances.delete(id);
-                        idleSince = null; // re-arm the idle clock on membership change
-                        log(`hub: pruned instance ${id} (probe: endpoint unreachable)`);
+                    const entry = instances.get(id);
+                    if (!entry)
+                        continue; // unregistered while probing
+                    if (ok) {
+                        delete entry.unhealthySince;
+                        continue;
                     }
+                    const unhealthySince = entry.unhealthySince ?? now;
+                    entry.unhealthySince = unhealthySince;
+                    if (now - unhealthySince < probeGraceMs) {
+                        log(`hub: instance ${id} probe failed — marked unhealthy (grace window)`);
+                        continue;
+                    }
+                    instances.delete(id);
+                    idleSince = null; // re-arm the idle clock on membership change
+                    const unhealthyForS = Math.round((now - unhealthySince) / 100) / 10;
+                    log(`hub: pruned instance ${id} (probe: unreachable for ${unhealthyForS}s)`);
                 }
             }
             // Cross-instance session dedupe: every bridge of a workspace lists the
@@ -1601,6 +1639,8 @@ export function startHub(options) {
                     return;
                 }
                 const prev = instances.get(id);
+                // A fresh entry drops any unhealthySince probe mark — a bridge alive
+                // enough to heartbeat is alive, whatever its port did during a stall.
                 instances.set(id, {
                     id,
                     port: bridgePort,

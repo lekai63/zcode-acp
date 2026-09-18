@@ -8,11 +8,14 @@
  *
  * The response mirrors the CLI card's data model so clients can reproduce it
  * exactly: one GLM section (plan level + per-window items with per-model
- * details) and one Opencode Go section (rolling/weekly/monthly windows, the
- * relative reset countdown converted to an absolute timestamp). Provider
- * failures are reported per-section as `kind` strings rather than throwing —
- * the client renders the same status line the CLI would (a `not_configured`
- * Go section is simply omitted, matching the CLI).
+ * details), one Opencode Go section (rolling/weekly/monthly windows, the
+ * relative reset countdown converted to an absolute timestamp), and one
+ * Ollama Cloud section (session/weekly/monthly fractions as percents, with
+ * the derived reset moments when available — the API itself returns none).
+ * Provider failures are reported per-section as
+ * `kind` strings rather than throwing — the client renders the same status
+ * line the CLI would (a `not_configured` section is simply omitted, matching
+ * the CLI).
  */
 import { queryCombined } from "../quota/combined.js";
 /** Window labels matching the CLI's card (`5h` / `Week` / `Month`). */
@@ -51,9 +54,39 @@ function toGoStats(result, now = Date.now()) {
     });
     return { kind: "success", windows };
 }
-/** `account/usage_stats` handler — both providers, queried in parallel. */
+/**
+ * Ollama windows as percents — the API's 0..1 fractions converted once here
+ * so remote clients can render the same bar the CLI does. Which windows exist
+ * depends on the plan (legacy: session+weekly; credit: monthly). The derived
+ * reset moments pass through when present.
+ */
+function toOcStats(result) {
+    if (result.kind !== "success")
+        return { kind: result.kind };
+    const LABELS = { session: "5h", weekly: "Week", monthly: "Month" };
+    const RESETS = {
+        session: "sessionResetAt",
+        weekly: "weeklyResetAt",
+        monthly: "monthlyResetAt",
+    };
+    const windows = ["session", "weekly", "monthly"].flatMap((key) => {
+        if (result[key] === undefined)
+            return [];
+        const reset = result[RESETS[key]];
+        return [
+            {
+                key,
+                label: LABELS[key],
+                usagePercent: result[key] * 100,
+                ...(typeof reset === "number" && { resetsAt: reset }),
+            },
+        ];
+    });
+    return { kind: "success", windows };
+}
+/** `account/usage_stats` handler — all providers, queried in parallel. */
 export async function accountUsageStats() {
-    const { glm, go } = await queryCombined("all");
-    return { glm: toGlmStats(glm), opencode: toGoStats(go) };
+    const { glm, go, oc } = await queryCombined("all");
+    return { glm: toGlmStats(glm), opencode: toGoStats(go), ollama: toOcStats(oc) };
 }
 //# sourceMappingURL=account.js.map

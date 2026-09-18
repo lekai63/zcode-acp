@@ -32,6 +32,12 @@ export interface HubOptions {
     token: string;
     /** Registration TTL before an instance is pruned (default 30s). */
     heartbeatTimeoutMs?: number;
+    /**
+     * How long an instance must stay probe-unreachable before ?probe=1 prunes it
+     * (default 8s). A single failed probe only marks it unhealthy — a busy
+     * bridge's event loop can stall past the connect timeout while fully alive.
+     */
+    probeGraceMs?: number;
     /** Idle time with zero instances and zero proxies before exit (default 10min). */
     idleExitMs?: number;
     /** WebSocket keepalive ping interval (default 30s; tunnels drop idle links). */

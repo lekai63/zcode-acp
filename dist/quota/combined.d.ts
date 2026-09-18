@@ -2,27 +2,31 @@
  * Combined multi-provider quota — the orchestration layer used by the
  * `zcode-acp quota` CLI when no provider subcommand is given (default mode).
  *
- * Queries GLM Coding Plan and Opencode Go in parallel and renders a single
- * merged card with one section per provider. The `/quota` slash command does
- * NOT use this — it stays on the single-provider GLM {@link formatQuota}.
+ * Queries GLM Coding Plan, Opencode Go, and Ollama Cloud in parallel and
+ * renders a single merged card with one section per provider. The `/quota`
+ * slash command does NOT use this — it stays on the single-provider GLM
+ * {@link formatQuota}.
  *
  * Design notes:
- *   - `Promise.all` so a slow Opencode Go scrape doesn't delay the GLM card.
- *   - A `not_configured` Opencode Go result is silently dropped (no header,
- *     no error line) in `all` mode, so GLM-only users see no noise. In `go`
- *     mode it surfaces as a help line because the user explicitly asked.
+ *   - `Promise.all` so a slow provider scrape doesn't delay the others.
+ *   - A `not_configured` non-GLM result is silently dropped (no header,
+ *     no error line) in `all` mode, so GLM-only users see no noise. In that
+ *     provider's own mode it surfaces as a help line because the user
+ *     explicitly asked.
  *   - The divider width is computed from the widest body line so the frame
  *     stays balanced regardless of which windows/counts are present.
  */
 import type { FormatOptions } from "./format.js";
+import type { OcQueryResult } from "./ollama-cloud/types.js";
 import type { GoQueryResult, GoWindowKey } from "./opencode-go/types.js";
 import type { QuotaResult } from "./types.js";
 /** Which provider(s) to query. */
-export type Provider = "all" | "glm" | "go";
-/** The combined result of both providers. */
+export type Provider = "all" | "glm" | "go" | "oc";
+/** The combined result of all providers. */
 export interface CombinedResult {
     glm: QuotaResult;
     go: GoQueryResult;
+    oc: OcQueryResult;
 }
 /**
  * Which Opencode Go windows to render. All three (rolling + weekly + monthly)

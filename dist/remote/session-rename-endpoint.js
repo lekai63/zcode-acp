@@ -70,6 +70,9 @@ async function handleRename(server, req, res, sessionId) {
         .trim()
         .slice(0, 80);
     server.sessionTitles.set(sessionId, title);
+    // Manual rename wins over the backend's later `generated` title pushes
+    // (SessionTitleListener consults this set).
+    server.titleUserSetBy.add(sessionId);
     server.touchSessionSummary(sessionId, title);
     refreshTerminalTabTitle(server, sessionId);
     const zcodeSid = server.resolveSid(sessionId);

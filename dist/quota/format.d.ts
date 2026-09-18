@@ -14,6 +14,7 @@
  * Inside a monospace code block the full-block reads as a solid, high-impact
  * fill for used quota, with the light shade marking the remainder.
  */
+import type { OcQueryResult } from "./ollama-cloud/types.js";
 import type { GoQueryResult } from "./opencode-go/types.js";
 import type { QuotaResult } from "./types.js";
 /**
@@ -123,6 +124,17 @@ export declare function formatQuotaDock(result: QuotaResult): string | null;
  * auth error, unavailable, or no monthly window exposed by the dashboard).
  */
 export declare function formatGoDockSegment(go: GoQueryResult): string | null;
-/** Join the GLM dock line and the Go segment; `null` when both are absent. */
-export declare function composeQuotaDock(glm: string | null, go: string | null): string | null;
+/**
+ * Compact Ollama Cloud segment for the dock, showing ONLY the largest window
+ * the plan exposes — monthly for credit plans, else weekly, else the 5h
+ * session — as `oc 60.3% 10-11`: percent at one-decimal precision plus the
+ * derived reset stamp (clock time for 5h, date for weekly/monthly; omitted
+ * when the monthly /api/me lookup failed). The window label is deliberately
+ * omitted: it is constant per plan and the reset stamp already tells the
+ * windows apart. `null` when Ollama is not usable (not configured, auth
+ * error, unavailable, or no windows).
+ */
+export declare function formatOcDockSegment(oc: OcQueryResult): string | null;
+/** Join the dock segments; `null` when all are absent. */
+export declare function composeQuotaDock(...segments: (string | null)[]): string | null;
 //# sourceMappingURL=format.d.ts.map

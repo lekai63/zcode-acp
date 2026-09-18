@@ -17,8 +17,9 @@ import { buildConfigOptions } from "../config/options.js";
 import { parseRemoteConfig } from "../remote/config.js";
 import { log, warn } from "../utils.js";
 import { enqueueSessionSend } from "../handlers/io.js";
-import { composeQuotaDock, formatGoDockSegment, formatQuotaDock } from "./format.js";
+import { composeQuotaDock, formatGoDockSegment, formatOcDockSegment, formatQuotaDock, } from "./format.js";
 import { queryQuota } from "./index.js";
+import { queryOcUsage } from "./ollama-cloud/index.js";
 import { queryGoUsage } from "./opencode-go/index.js";
 /** Interval between background refreshes. */
 export const QUOTA_REFRESH_INTERVAL_MS = 60_000;
@@ -102,13 +103,18 @@ export async function fetchDockText(env = process.env) {
             // hub absent/restarting — silent fallback below
         }
     }
-    // Go is best-effort: not_configured / auth_error / fetch failure renders as
-    // no segment, never blocking the GLM line.
-    const [glm, go] = await Promise.all([
+    // Go and Ollama Cloud are best-effort: not_configured / auth_error / fetch
+    // failure renders as no segment, never blocking the GLM line.
+    const [glm, go, oc] = await Promise.all([
         queryQuota().then(formatQuotaDock),
-        queryGoUsage().then(formatGoDockSegment).catch(() => null),
+        queryGoUsage()
+            .then(formatGoDockSegment)
+            .catch(() => null),
+        queryOcUsage()
+            .then(formatOcDockSegment)
+            .catch(() => null),
     ]);
-    return composeQuotaDock(glm, go);
+    return composeQuotaDock(glm, go, oc);
 }
 /**
  * Response-time backstop for the first-fetch race: the first refresh can
