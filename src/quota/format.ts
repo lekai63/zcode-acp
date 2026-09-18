@@ -16,7 +16,9 @@
  */
 
 import { pickOverlay, renderColorBar } from "./color.js";
+import type { OcQueryResult } from "./ollama-cloud/types.js";
 import type { GoQueryResult } from "./opencode-go/types.js";
+import { roundTenth } from "./rounding.js";
 import type { QuotaItem, QuotaResult } from "./types.js";
 
 /**
@@ -330,9 +332,40 @@ export function formatGoDockSegment(go: GoQueryResult): string | null {
   return `go ${go.monthly.usagePercent}% ${date}`;
 }
 
-/** Join the GLM dock line and the Go segment; `null` when both are absent. */
-export function composeQuotaDock(glm: string | null, go: string | null): string | null {
-  const parts = [glm, go].filter((s): s is string => s !== null);
+/**
+ * Compact Ollama Cloud segment for the dock, showing ONLY the largest window
+ * the plan exposes — monthly for credit plans, else weekly, else the 5h
+ * session — as `oc 60.3% 10-11`: percent at one-decimal precision plus the
+ * derived reset stamp (clock time for 5h, date for weekly/monthly; omitted
+ * when the monthly /api/me lookup failed). The window label is deliberately
+ * omitted: it is constant per plan and the reset stamp already tells the
+ * windows apart. `null` when Ollama is not usable (not configured, auth
+ * error, unavailable, or no windows).
+ */
+export function formatOcDockSegment(oc: OcQueryResult): string | null {
+  if (oc.kind !== "success") return null;
+  const pct = (f: number): string => {
+    const v = roundTenth(Math.max(0, Math.min(100, f * 100)));
+    return Number.isInteger(v) ? String(v) : v.toFixed(1);
+  };
+  if (typeof oc.monthly === "number") {
+    const date = formatResetDate(oc.monthlyResetAt);
+    return `oc ${pct(oc.monthly)}%${date ? ` ${date}` : ""}`;
+  }
+  if (typeof oc.weekly === "number") {
+    const date = formatResetDate(oc.weeklyResetAt);
+    return `oc ${pct(oc.weekly)}%${date ? ` ${date}` : ""}`;
+  }
+  if (typeof oc.session === "number") {
+    const clock = formatResetClock(oc.sessionResetAt);
+    return `oc ${pct(oc.session)}%${clock ? ` ${clock}` : ""}`;
+  }
+  return null;
+}
+
+/** Join the dock segments; `null` when all are absent. */
+export function composeQuotaDock(...segments: (string | null)[]): string | null {
+  const parts = segments.filter((s): s is string => s !== null);
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 

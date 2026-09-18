@@ -96,6 +96,94 @@ ZCode protocol types into ACP notifications directly — always translate.
 - **ZCode backend version drift**: the backend may change event payloads between
   releases. When diff display or event handling breaks, check the raw backend
   event with `ZCODE_ACP_DEBUG=1` before changing translator code.
+- **3.12.3+ desktop bundles pass the CLI's provider table via env, not the
+  filesystem** (observed 2026-09; the CLI still self-reports "0.16.5"): the
+  desktop host resolves `zcode-builtin.json` at `Resources/config/provider/`
+  and injects it as `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` (verified in
+  app.asar). The CLI's own lookup only knows `<entryDir>/provider/` and a
+  five-up `config/` for the dev monorepo tree — which lands on `/` under the
+  .app layout — so a bare bundle spawn exits in <1s (the
+  "无法定位 CLI ZCode Built-in Provider Config" error, code 1) and stays dead
+  after each app update until the CLI's
+  `~/.zcode/v2/runtime/provider/<plat>/<ver>/endpoint-<hash>/` sync happens
+  to run (itself needing a valid source). `builtinProviderEnv`
+  (src/backend/resolve.ts, merged in `ensureBackend`) mirrors the host's
+  injection: locate the config next to the CLI entry (sibling `provider/`, or
+  `../config/provider/`) and set the env for the spawn. The derived value
+  OVERRIDES any inherited ambient copy — the host injects version-keyed
+  runtime paths that go stale across app updates. Boot frames are queued, not
+  dropped, but a COLD first boot can exceed 20s (provider sync fetch) — a
+  one-off request timeout; the next attempt succeeds. The update is otherwise
+  compatible: session/create already speaks the `{workspace:{…}}` /
+  `result.session.*` shape the bridge uses, `startup/storageState`
+  notifications are boot noise, tasks-index.sqlite only grew defaulted
+  columns after our INSERT list, and unknown server→client requests
+  (`interaction/requestOfficialMcpAuthHeaders`) land safely in the
+  unhandled-request error path.
+- **3.12+ model switching: account-plan providers are HOST-pushed, and
+  `session/setModel` lost its `runtimeModel` overlay.** Two coupled changes
+  (both verified 2026-09 against the bare app-server): (1) the registry is
+  built from the bundled table + `provider_config.json` + an ACCOUNT snapshot
+  the desktop host computes and pushes over `provider/updateAccountConfig`;
+  headless launches have no host, so every `account:*` coding-plan provider
+  reads `entitled:false`, the GLM models never appear in
+  `settings.model.available`, and switches fail with "Provider Registry 中不存在
+  Model". The bridge now pushes that snapshot itself (`config/account-provider.ts`,
+  called from `syncProviderRegistry` before session/create). The payload's
+  `basedOnZCodeBuiltinRevision` MUST be `zcode-builtin:<file.revision>:<sha256(PATH)>`
+  — the hash covers the provider-table PATH, not the bytes, and a mismatch
+  makes the backend accept the push but silently ignore it; derive it from the
+  SAME path `ensureBackend` injects (reading the ambient env first points at a
+  version-keyed runtime copy and yields a rejected revision — that failure
+  mode is the trap). **Both env vars are load-bearing**: the CLI's provider
+  bootstrap uses the injected builtin path VERBATIM only when
+  `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` is set alongside
+  `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`; with the builtin alone it re-syncs the
+  table into a version-keyed runtime copy (`~/.zcode/v2/runtime/provider/<plat>/<ver>/…`)
+  and rewires its configRevision to THAT copy's path — every account switch
+  then answers "Provider Registry 中不存在 Model" while probe environments
+  without the re-sync trigger look perfectly healthy (observed 2026-09-17:
+  the user's terminal took the re-sync path deterministically, the dev shell
+  never did; `builtinProviderEnv` now injects both vars). 3.12 also renamed
+  the config-file model spelling to `custom:<urlencoded providerId>:<modelId>`
+  (see `~/.zcode/agents/*.md`); `parseModelValue` accepts it. Entitlement
+  comes from `coding-plan-cache.json`
+  (desktop's resolved availability verdict) → legacy `config.json`
+  (`builtin:*` enabled + apiKey); `setting.json`'s
+  `modelProviderFamilySelectedKeys` is a _selection_ record, not an
+  entitlement — only as a last resort when both are empty. (2) `session/setModel`
+  is now strict: `{sessionId, model:{providerId, modelId, options?}, persistAsWorkspaceLastUsed}`,
+  NO `runtimeModel` (`Unrecognized key`), and the OBJECT form requires
+  `options.reasoningLevel` for level-bearing models ("Reasoning level is
+  required for <p>/<m>") — the string form skips that check but carries no
+  level. Provider ids must also be translated to the registry's spelling
+  (`builtin:bigmodel-coding-plan` → `account:bigmodel-individual-coding-plan`,
+  `accountProviderIdFor`). `session/create` is the only response returning the
+  FULL `settings.model.available` list (with authoritative `reasoning.defaultLevel`);
+  `session/read` answers `"current"` only, so the create snapshot is cached in
+  `server.modelAvailability` for switch-time level resolution. `applyModelSwitch`
+  tries the modern shape then falls back once to the legacy overlay shape, so the
+  same bridge works on both builds. `workspace/updateProviderRegistry` is
+  GONE in 3.12+ (method-not-found) — the bridge logs it as a no-op, not a
+  failure. Also note `session.model_selection.persist_failed` ("FOREIGN KEY
+  constraint failed") fires on EVERY setModel since at least 2026-09-14 —
+  including working third-party switches — it is a backend-side persistence
+  wart, NOT a switch failure (the following `session.model.updated` event is
+  the success signal); don't chase it as a switching bug. **Account turns
+  also need runtime headers**: the backend asks its host
+  `interaction/requestProviderRuntimeHeaders` before EVERY model request on a
+  `zhipu-account` provider and a `headersApplied:false` answer throws -32031
+  (every send on a GLM model dies in a retry loop — observed 2026-09-17 after
+  switching started working; the switch looked fine, sends never ran). The
+  bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
+  config.json key for individual coding plans
+  (`codingPlanRequestAuthFor`, server-requests.ts) — the same key the
+  pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
+  captcha, #123). The backend's own "standalone" self-signing channel needs
+  an identity credential pair in its ENCRYPTED store
+  (`account-provider:…:account:<uid>:api-key` exists but the `…:identity`
+  half was never written on the observed machine), so the bridge cannot rely
+  on it.
 - **The backend ignores `session/stop`** (verified against app-server 0.16.5 —
   the model stream runs to its natural end no matter what). Cancel is therefore
   bridge-side only: the turn loop returns `cancelled` at once, and the next

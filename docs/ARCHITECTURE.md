@@ -170,16 +170,17 @@ API only because the ZCode backend itself sends them for inference.
 
 ### `handlers/` — ACP method handling
 
-| File                  | Responsibility                                                                                                                                                                                          |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `session.ts`          | session/new/list/resume/load/prompt/set_config_option/cancel                                                                                                                                            |
-| `extensions.ts`       | fork/rewind/rewindCascade/goal/compact/steer/cancelBackgroundTask/setModel/setMode/setThoughtLevel                                                                                                      |
-| `dispatch.ts`         | dispatchEvent single exit point: InternalEvent → ACP session/update                                                                                                                                     |
-| `background-tasks.ts` | Session-scoped `BackgroundTaskListener` — forwards background sub-agent status (`session.updated` taskId) + completion-notification turns to the client OUTSIDE request handlers (lives across prompts) |
-| `server-requests.ts`  | Handle zcode interaction/* requests (tool auth, ExitPlanMode, AskUserQuestion), protocol negotiation routing                                                                                            |
-| `io.ts`               | ACP notification helpers (including `sendAvailableCommandsDeferred` deferred notification)                                                                                                              |
-| `slash.ts`            | Interception of `/`-prefixed commands (/compact /goal /fork /rewind /steer /model /mode /thought); non-advertised `/x` prompts are neutralized into plain text (`neutralizeSlashText`)                  |
-| `account.ts`          | `account/usage_stats` — account-level plan quota for remote clients (Proposal 0002; quota pipeline + graceful error)                                                                                    |
+| File                  | Responsibility                                                                                                                                                                                                         |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `session.ts`          | session/new/list/resume/load/prompt/set_config_option/cancel                                                                                                                                                           |
+| `extensions.ts`       | fork/rewind/rewindCascade/goal/compact/steer/cancelBackgroundTask/setModel/setMode/setThoughtLevel                                                                                                                     |
+| `dispatch.ts`         | dispatchEvent single exit point: InternalEvent → ACP session/update                                                                                                                                                    |
+| `background-tasks.ts` | Session-scoped `BackgroundTaskListener` — forwards background sub-agent status (`session.updated` taskId) + completion-notification turns to the client OUTSIDE request handlers (lives across prompts)                |
+| `session-titles.ts`   | Session-scoped `SessionTitleListener` — adopts backend `session.titleUpdated` pushes (`generated`/`custom` sources; manual renames win) into sessionTitles/tasks-index/terminal tab + broadcasts `session_info_update` |
+| `server-requests.ts`  | Handle zcode interaction/* requests (tool auth, ExitPlanMode, AskUserQuestion), protocol negotiation routing                                                                                                           |
+| `io.ts`               | ACP notification helpers (including `sendAvailableCommandsDeferred` deferred notification)                                                                                                                             |
+| `slash.ts`            | Interception of `/`-prefixed commands (/compact /goal /fork /rewind /steer /model /mode /thought); non-advertised `/x` prompts are neutralized into plain text (`neutralizeSlashText`)                                 |
+| `account.ts`          | `account/usage_stats` — account-level plan quota for remote clients (Proposal 0002; quota pipeline + graceful error)                                                                                                   |
 
 ### `interaction/` — Interaction bridging
 
@@ -226,8 +227,11 @@ would keep running pre-upgrade code until its 10-minute idle exit.
 Discovery liveness has two layers: the heartbeat TTL (30s, pruned every 5s)
 drops bridges that stopped registering — the fallback for hard kills — and
 `GET /api/instances?probe=1` actively TCP-probes each registered loopback port
-on demand, so a client refresh gets an immediately-honest list with no
-background probing cost.
+on demand, so a client refresh gets an honest list with no background probing
+cost. A probe failure is not a verdict: the first one only marks the instance
+unhealthy, and ~8s of continuous unreachability (confirmed by a later probe)
+prunes it — a busy bridge's event loop can stall past the connect timeout
+while perfectly alive, and evicting it would kick every attached client.
 
 Session file access (ADR-0004) rides the same loopback server: the bridge
 serves read-only `GET /fs/list` + `GET /fs/file` scoped to each session's cwd,

@@ -5,6 +5,77 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.2](https://github.com/william0wang/zcode-acp/compare/v0.43.1...v0.43.2) (2026-09-18)
+
+
+### Bug Fixes
+
+* derive the account-to-config provider id mapping without the bundled table ([2b2fc7b](https://github.com/william0wang/zcode-acp/commit/2b2fc7b363478763d2d51f99c0dd13288ced6c5d))
+
+## [0.43.1](https://github.com/william0wang/zcode-acp/compare/v0.43.0...v0.43.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* prefer the configured model context window over the backend's placeholder in usage_update ([41d719a](https://github.com/william0wang/zcode-acp/commit/41d719aa41802f0db64458d16022aa3dabcaf9f9))
+
+## [0.43.0](https://github.com/william0wang/zcode-acp/compare/v0.42.5...v0.43.0) (2026-09-18)
+
+
+### Features
+
+* adopt backend session titles and extend the busy window for background notification turns ([2cc671e](https://github.com/william0wang/zcode-acp/commit/2cc671e2c06111537e119bafd263605c0ea75167))
+
+## [0.42.5](https://github.com/william0wang/zcode-acp/compare/v0.42.4...v0.42.5) (2026-09-17)
+
+
+### Bug Fixes
+
+* answer provider runtime headers with the coding-plan API key so GLM turns run ([ce3bdec](https://github.com/william0wang/zcode-acp/commit/ce3bdec14cd9f17090ca46a8ca00d235e2e144ce))
+
+## [0.42.4](https://github.com/william0wang/zcode-acp/compare/v0.42.3...v0.42.4) (2026-09-17)
+
+
+### Bug Fixes
+
+* inject both provider-config env vars so the 3.12+ CLI uses the bundled table verbatim ([b0ecb89](https://github.com/william0wang/zcode-acp/commit/b0ecb8926860c1ee70a0f6f14aa1d2fc020f346f)), closes [#202](https://github.com/william0wang/zcode-acp/issues/202)
+
+## [0.42.3](https://github.com/william0wang/zcode-acp/compare/v0.42.2...v0.42.3) (2026-09-17)
+
+
+### Bug Fixes
+
+* push the account provider snapshot and use the 3.12+ setModel shape so coding-plan models switch ([80ad523](https://github.com/william0wang/zcode-acp/commit/80ad523d42bea857bf920f9c4fe223b17f653b57))
+
+## [0.42.2](https://github.com/william0wang/zcode-acp/compare/v0.42.1...v0.42.2) (2026-09-17)
+
+
+### Bug Fixes
+
+* inject ZCODE_BUILTIN_PROVIDER_CONFIG_FILE for bundled CLI launches ([8293b7c](https://github.com/william0wang/zcode-acp/commit/8293b7c4c3c8210e779a4f894018a8c5760010b6))
+* require sustained probe failure before pruning a hub instance ([ea918c5](https://github.com/william0wang/zcode-acp/commit/ea918c51fa50eef641f8191f828abb9e72aeb0eb))
+
+## [0.42.1](https://github.com/william0wang/zcode-acp/compare/v0.42.0...v0.42.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* show Ollama Cloud dock percent at one-decimal precision and drop the constant window label ([95f01c9](https://github.com/william0wang/zcode-acp/commit/95f01c935d149b4d5c4a67e61094a3264eef1a6a))
+
+## [0.42.0](https://github.com/william0wang/zcode-acp/compare/v0.41.0...v0.42.0) (2026-09-17)
+
+
+### Features
+
+* drop the TPS dock segment and show Ollama Cloud quota with derived reset times ([83e7bcb](https://github.com/william0wang/zcode-acp/commit/83e7bcbacec46556db57edb044dd8c99f2f9c34c))
+
+## [0.41.0](https://github.com/william0wang/zcode-acp/compare/v0.40.1...v0.41.0) (2026-09-16)
+
+
+### Features
+
+* add Ollama Cloud quota card with dual-plan support and unified quota credentials in user config ([2c9a076](https://github.com/william0wang/zcode-acp/commit/2c9a076e490fab97902f977f9a7a6428ad6e7f67))
+
 ## [0.40.1](https://github.com/william0wang/zcode-acp/compare/v0.40.0...v0.40.1) (2026-09-16)
 
 

@@ -10,6 +10,7 @@
 import type * as acp from "@agentclientprotocol/sdk";
 
 import {
+  builtinProviderEnv,
   loadZcodeCredentials,
   mergeEnvWithCreds,
   resolveZcodeCommand,
@@ -19,6 +20,7 @@ import { armSandboxArgv, collectSandboxWorkspaces, sandboxActive } from "./backe
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { SandboxRestartBatcher, flushSandboxGrants } from "./handlers/sandbox-allow.js";
+import { SessionTitleListener } from "./handlers/session-titles.js";
 import { ClientRegistry } from "./remote/broadcast.js";
 import { AGENT_INFO, clientConnectionRoot, PROTOCOL_VERSION, log, warn } from "./utils.js";
 
@@ -328,6 +330,18 @@ export class ZcodeAcpServer {
   /** Per-session model cache for configOptions model dropdown. */
   readonly modelCache = new Map<string, string>();
   /**
+   * Per-session (zcodeSid) FULL model-availability list, captured from the
+   * `session/create` snapshot (`settings.model.available`). Only create/resume
+   * return the complete list with authoritative `reasoning.defaultLevel` —
+   * `session/read` answers `modelAvailability:"current"` (just the active
+   * model). Model switches need a target's default reasoning level, so this
+   * cache is the lookup; an entry that declares no levels simply has none.
+   */
+  readonly modelAvailability = new Map<
+    string,
+    Array<{ providerId?: string; modelId?: string; defaultLevel?: string }>
+  >();
+  /**
    * Per-session (zcodeSid) background-task listeners. Registered once when a
    * session is created/resumed/loaded and lives across prompts, forwarding
    * background task status + result notifications to the client outside of
@@ -335,6 +349,31 @@ export class ZcodeAcpServer {
    * (backend.listeners is now a Set per session).
    */
   readonly backgroundListeners = new Map<string, BackgroundTaskListener>();
+  /**
+   * Backend instance each session's out-of-band listeners were registered on.
+   * The backend can be REPLACED mid-session (sandbox arm-flip, dynamic allow
+   * batches, dead-reader recovery) and listeners are per-instance — when this
+   * map's entry differs from the current backend, ensureBackgroundListener
+   * re-registers (also called from the prompt path so a respawn heals on the
+   * next turn, not just on resume/load).
+   */
+  readonly backgroundListenerBackend = new Map<string, ZcodeBackend>();
+  /**
+   * Sessions (zcodeSid) whose background NOTIFICATION turn (the model
+   * summarising a finished background task) is currently running, → start
+   * time. Maintained by BackgroundTaskListener; read by the prompt path to
+   * extend the send busy-retry budget — a notification turn is a real model
+   * turn and easily outlives the normal 30s busy window, after which the
+   * user's prompt would fail outright (#194-adjacent UX).
+   */
+  readonly notifyTurnActiveSince = new Map<string, number>();
+  /**
+   * Sessions (acpSid) whose title was set by MANUAL user intent (the remote
+   * rename endpoint, or a `session.titleUpdated` push with source "custom"
+   * from another surface). The backend's later `generated` title pushes must
+   * not override these (SessionTitleListener).
+   */
+  readonly titleUserSetBy = new Set<string>();
   /**
    * Per-Bash-callId stdout snapshot already streamed via terminal_output. Used
    * by dispatchTerminalUpdate for two dedup guards:
@@ -375,7 +414,9 @@ export class ZcodeAcpServer {
    */
   ensureBackend(): ZcodeBackend {
     if (this.backend && !this.backend.isDead) return this.backend;
-    const env = mergeEnvWithCreds(loadZcodeCredentials());
+    // builtinProviderEnv injects the CLI's built-in provider table the way the
+    // desktop host does — a bare .app-bundle CLI cannot find it on its own.
+    const env = { ...mergeEnvWithCreds(loadZcodeCredentials()), ...builtinProviderEnv() };
     let argv = resolveZcodeCommand();
     this.backendSandboxed = sandboxActive(this.sandboxRoots());
     if (this.backendSandboxed) {
@@ -554,12 +595,19 @@ export class ZcodeAcpServer {
    * backend's per-session listener Set.
    */
   ensureBackgroundListener(zcodeSid: string): BackgroundTaskListener {
-    const existing = this.backgroundListeners.get(zcodeSid);
-    if (existing) return existing;
     const backend = this.ensureBackend();
-    const listener = new BackgroundTaskListener(this, zcodeSid);
+    const existing = this.backgroundListeners.get(zcodeSid);
+    if (existing && this.backgroundListenerBackend.get(zcodeSid) === backend) return existing;
+    // Fresh session, or the backend was respawned since registration —
+    // (re-)register on the CURRENT instance; the old instance's listener set
+    // died with it, so there is no duplicate-registration risk.
+    const listener = existing ?? new BackgroundTaskListener(this, zcodeSid);
     this.backgroundListeners.set(zcodeSid, listener);
     backend.registerEventListener(zcodeSid, listener);
+    // The session-scoped title listener rides the same registration site and
+    // lifetime: one registration covers both out-of-band consumers.
+    backend.registerEventListener(zcodeSid, new SessionTitleListener(this, zcodeSid));
+    this.backgroundListenerBackend.set(zcodeSid, backend);
     log(`  [bg] background listener registered for ${zcodeSid}`);
     return listener;
   }

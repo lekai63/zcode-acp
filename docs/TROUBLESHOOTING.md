@@ -28,11 +28,84 @@
    - If not found, set: `export ZCODE_BIN=/path/to/zcode`
 
 3. Check the ZCode configuration:
+
    ```bash
    cat ~/.zcode/v2/config.json
    ```
    - Confirm a `provider` is enabled
    - Confirm `models` are defined
+
+4. Desktop-app CLI (3.12.3+) exits instantly with
+   `无法定位 CLI ZCode Built-in Provider Config`: the bundled CLI expects the
+   host to pass its provider table via `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`
+   (the desktop app does exactly that); launched bare, its own file lookup
+   cannot find the copy the bundle ships at `Resources/config/provider/`.
+   The bridge injects BOTH provider-table env vars automatically (see
+   `builtinProviderEnv` in `src/backend/resolve.ts`), deriving the builtin
+   path from the CLI it launches — the CLI uses an injected path verbatim
+   only when `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` is set alongside it (it
+   defaults to `~/.zcode/v2/provider_config.json`); with the builtin var
+   alone the CLI re-syncs the table into a version-keyed runtime copy, which
+   voids the bridge's account-config push (next section). The derived value
+   also overrides an inherited ambient copy, which is version-keyed and goes
+   stale across app updates. To force a custom table, point `ZCODE_BIN` at a
+   CLI whose directory carries no adjacent `zcode-builtin.json` and export
+   the env var yourself.
+
+### Switching to a GLM coding-plan model fails / snaps back to a third-party model
+
+**Symptom:** picking GLM-5.3 (or GLM-5.3-Flash) in the model picker errors out or the UI
+immediately falls back to a third-party model (e.g. DeepSeek); third-party models switch
+fine. The bridge log (`ZCODE_ACP_DEBUG=1`) shows
+`runtime-model: switch failed (modern: Provider Registry 中不存在 Model …)`.
+
+**Why:** on 3.12+ the backend registry is entitled by an account snapshot the bridge
+pushes (`provider/updateAccountConfig`). The push carries a `basedOnZCodeBuiltinRevision`
+hash of the provider-table PATH the backend resolved; if the backend resolved a different
+copy (its version-keyed runtime copy under
+`~/.zcode/v2/runtime/provider/<plat>/<version>/…` instead of the injected
+`Resources/config/provider/` path), it accepts the push but silently ignores it — every
+`account:*` model is then "not in the Provider Registry". The CLI only uses an injected
+builtin path verbatim when BOTH `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and
+`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` are set; `builtinProviderEnv` injects both.
+
+**Troubleshooting steps:**
+
+1. Check which table the backend resolved:
+
+   ```bash
+   grep -a provider_registry.ready ~/.zcode/cli/log/zcode-$(date +%F).jsonl | tail -1
+   ```
+
+   The `configRevision` hash must match the injected path. Verify with:
+
+   ```bash
+   python3 -c "import hashlib,os;print(hashlib.sha256(b'/Applications/ZCode.app/Contents/Resources/config/provider/zcode-builtin.json').hexdigest()[:16])"
+   ```
+
+2. If the hashes differ, the bridge is older than the dual-env fix (0.42.4+) or
+   `ZCODE_BIN` points at a CLI without an adjacent `zcode-builtin.json` — check
+   `echo $ZCODE_BIN` in the launching shell.
+
+3. Note `session.model_selection.persist_failed` ("FOREIGN KEY constraint failed")
+   appears on EVERY switch — including working ones — and is a backend persistence
+   wart, not the switching bug. The success signal is the following
+   `session.model.updated` event in the same log.
+
+### Switching to a GLM model works but every send fails / retries forever
+
+**Symptom:** the model picker shows the GLM model after switching, but sending a
+message errors immediately and retries; the backend log shows
+`model.request.failed` with `reason:"unknown"` on `account:bigmodel-…` providers.
+
+**Why:** the 3.12+ backend asks its host for provider runtime headers
+(`interaction/requestProviderRuntimeHeaders`) before EVERY model request on an
+account provider. A `headersApplied:false` answer makes the turn fail with
+-32031 and retry. The bridge (0.42.5+) answers with the coding plan's API key
+from `~/.zcode/v2/config.json` (`codingPlanRequestAuthFor`) — if sends still
+fail, check that the enabled `builtin:bigmodel-coding-plan` entry carries a
+non-empty `options.apiKey` in that file. Start-plan providers stay declined
+(Aliyun captcha — desktop app only, issue #123).
 
 ### Authentication / credential errors (401, provider auth failed)
 
@@ -368,9 +441,11 @@ or a WS connect to it fails.
 
 1. Hard-killed bridges (Zed force-kill, crash) never unregister — the hub's
    heartbeat TTL drops them within ~30s.
-2. For an immediately-honest list, call `GET /api/instances?probe=1`: the hub
-   TCP-probes each registered port and prunes unreachable bridges first.
-   Clients should use this on refresh.
+2. For an honest list without waiting out the TTL, call
+   `GET /api/instances?probe=1`: the hub TCP-probes each registered port and
+   prunes bridges that stay unreachable ~8s (one failed probe only marks the
+   instance unhealthy — a busy bridge can stall past the probe timeout while
+   alive). Clients should use this on refresh.
 3. A few-seconds outage after upgrading the package is expected: a newer
    bridge triggers the hub's version-handshake restart, then re-spawns it.
 
