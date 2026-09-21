@@ -804,10 +804,42 @@ subset to the ACP client:
 
 ### Synchronous sub-agent (blocking)
 
-The `Agent` tool blocks until the sub-agent finishes. Its internal tool calls
-(`Read`, `Bash`, …) arrive as ordinary `tool.updated` events on the main stream
-and are forwarded as regular `tool_call` cards. The `Agent` card itself carries
-structured metadata in `_meta.subagent` (parsed from the result content):
+The `Agent` tool blocks until the sub-agent finishes. A sub-agent runs as its
+own CHILD session (`sess_subagent_agent_<uuid>`, `task_type:"subagent_child"`,
+read-only for `session/send`), and the backend mirrors the child's tool
+lifecycle into the **parent** stream as `tool.updated` events tagged
+`source:"subagent"` (`core/src/subagent/tool-event-mirror.ts`):
+
+```json
+{
+  "type": "tool.updated",
+  "payload": {
+    "kind": "scheduled",
+    "toolCallId": "tool_subagent_agent_73c7c63d…_call_child",
+    "childToolCallId": "call_child",
+    "agentId": "agent_73c7c63d-…",
+    "agentType": "Explore",
+    "childSessionId": "sess_subagent_agent_73c7c63d-…",
+    "parentToolCallId": "call_xxx",
+    "description": "search the repo",
+    "background": false,
+    "source": "subagent",
+    "toolName": "Read",
+    "input": { "file_path": "src/index.ts" }
+  }
+}
+```
+
+These mirrors describe the SUB-AGENT's work, not the main agent's, so the bridge
+does **not** render them as parent `tool_call` cards (the vendor's own clients
+reject them from the main transcript — `tui/SUBAGENTS.md`). The session-scoped
+`SubagentTracker` (`handlers/subagents.ts`) folds them into one compact activity
+log per agent, reconciles against the authoritative directory
+(`session/subagents` → `{revision, childSessionIds, running[], ended:{items}}`,
+which also reports agents that finished before the bridge attached), and
+publishes the result as the `_zcode/subagent` vendor notification below. The
+`Agent` card itself still carries `_meta.subagent` with the parsed `<usage>`
+markers:
 
 ```json
 {
@@ -825,6 +857,58 @@ structured metadata in `_meta.subagent` (parsed from the result content):
   }
 }
 ```
+
+### `_zcode/subagent` — sub-agent activity (vendor notification)
+
+One notification per sub-agent **revision** (trailing-edge throttled to 500 ms,
+always flushed on a terminal status). Emitted only for sessions where at least
+one sub-agent was seen:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "_zcode/subagent",
+  "params": {
+    "sessionId": "sess_abc123",
+    "acpSessionId": "acp_1",
+    "agentId": "agent_73c7c63d-…",
+    "agentType": "Explore",
+    "childSessionId": "sess_subagent_agent_73c7c63d-…",
+    "parentToolCallId": "call_xxx",
+    "title": "search the repo",
+    "status": "running",
+    "background": false,
+    "startedAt": 1789747883296,
+    "summary": "12 files matched",
+    "errorMessage": "spawn_error",
+    "tokens": 40904,
+    "toolUses": 7,
+    "durationMs": 10559,
+    "log": ["[Read] src/index.ts", "[Read] done", "[Bash] pnpm test"],
+    "revision": 3
+  }
+}
+```
+
+- `status` ∈ `running | completed | failed | canceled`, mapped from every
+  backend vocabulary (v3 running `running|waiting|blocked`; v3 ended
+  `success|failed|cancelled|lost`; background runtime
+  `completed|failed|stopped|timed_out|spawn_error`).
+- `parentToolCallId` is the `Agent`/`Task` dispatch call id: clients that render
+  sub-agents should key the card by it so it merges with the tool card already
+  held for the dispatch.
+- `log` is the full, de-duplicated, capped (200 lines / 240 chars) activity log,
+  oldest first — not a delta.
+- Agents that ended before the bridge attached are still reported (through
+  `session/subagents`), so history is renderable; running agents additionally
+  stream mirrored activity.
+
+`_zcode/subagent` is an ACP **extension method**: clients that do not know it
+ignore unknown notifications (nothing changes for Zed/Martty). Paseo's ACP shim
+routes every non-ACP notification to the plugin's `AcpTransformer.notification`
+hook, where `paseo-plugin-zcode` maps it onto a `sub_agent` timeline card
+(`ProviderToolCallDetail`) — the only route by which a plugin can render a
+sub-agent.
 
 ### Background sub-agent (`run_in_background: true`)
 

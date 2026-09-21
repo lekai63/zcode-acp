@@ -281,6 +281,15 @@ export class EventTranslator {
     const callId = (payload["toolCallId"] as string) ?? "";
     const toolName = (payload["toolName"] as string) ?? "";
 
+    // Sub-agent tool mirrors: zcode replays a CHILD session's tool lifecycle
+    // into the parent stream tagged `source:"subagent"` (callId
+    // `tool_subagent_<agentId>_<childToolCallId>`, see core/subagent/
+    // tool-event-mirror.ts). They describe the sub-agent's work, not the main
+    // agent's — the vendor's own clients reject them from the main transcript
+    // (tui/SUBAGENTS.md). Rendering them here produced phantom tool cards next
+    // to the `Agent` dispatch card; SubagentTracker consumes them instead and
+    // publishes them as `_zcode/subagent` vendor notifications.
+    if (payload["source"] === "subagent") return results;
     if (tkind === "scheduled") {
       const newEv = this.createToolCall(callId, toolName, payload["input"], "pending");
       if (newEv) results.push(newEv);
