@@ -12,6 +12,7 @@ import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { SandboxRestartBatcher, flushSandboxGrants } from "./handlers/sandbox-allow.js";
 import { SessionTitleListener } from "./handlers/session-titles.js";
+import { SubagentTracker } from "./handlers/subagents.js";
 import { ClientRegistry } from "./remote/broadcast.js";
 import { AGENT_INFO, clientConnectionRoot, PROTOCOL_VERSION, log, warn } from "./utils.js";
 /**
@@ -282,6 +283,13 @@ export class ZcodeAcpServer {
      */
     backgroundListenerBackend = new Map();
     /**
+     * Per-session (zcodeSid) sub-agent trackers. Registered at the same site and
+     * with the same lifetime as the background-task listener, so an `Agent`/`Task`
+     * dispatch that outlives its turn keeps reporting. Each tracker publishes
+     * `_zcode/subagent` vendor notifications (see handlers/subagents.ts).
+     */
+    subagentTrackers = new Map();
+    /**
      * Sessions (zcodeSid) whose background NOTIFICATION turn (the model
      * summarising a finished background task) is currently running, → start
      * time. Maintained by BackgroundTaskListener; read by the prompt path to
@@ -521,9 +529,32 @@ export class ZcodeAcpServer {
         // The session-scoped title listener rides the same registration site and
         // lifetime: one registration covers both out-of-band consumers.
         backend.registerEventListener(zcodeSid, new SessionTitleListener(this, zcodeSid));
+        // Sub-agent tracking follows the same session lifetime: an `Agent`/`Task`
+        // dispatch keeps working after its launching turn returned.
+        this.ensureSubagentTracker(zcodeSid);
         this.backgroundListenerBackend.set(zcodeSid, backend);
         log(`  [bg] background listener registered for ${zcodeSid}`);
         return listener;
+    }
+    /**
+     * Ensure a sub-agent tracker is registered for the session. Idempotent, and
+     * re-registers on a replaced backend instance exactly like
+     * ensureBackgroundListener. Called from that same registration site.
+     */
+    ensureSubagentTracker(zcodeSid) {
+        const backend = this.ensureBackend();
+        const existing = this.subagentTrackers.get(zcodeSid);
+        if (existing && this.backgroundListenerBackend.get(zcodeSid) === backend)
+            return existing;
+        const tracker = existing ?? new SubagentTracker(this, zcodeSid);
+        this.subagentTrackers.set(zcodeSid, tracker);
+        backend.registerEventListener(zcodeSid, tracker);
+        log(`  [subagent] tracker registered for ${zcodeSid}`);
+        return tracker;
+    }
+    /** The live backend instance, or null when none was spawned yet. */
+    currentBackend() {
+        return this.backend && !this.backend.isDead ? this.backend : null;
     }
     /**
      * Terminal records for in-flight background tasks before the backend
@@ -538,6 +569,17 @@ export class ZcodeAcpServer {
             }
             catch (e) {
                 warn(`shutdown task records failed for ${listener.zcodeSid}: ` +
+                    `${e instanceof Error ? e.message : String(e)}`);
+            }
+        }
+        // Sub-agent cards would otherwise stay in_progress forever once the
+        // backend subprocess dies with its in-memory registry.
+        for (const tracker of this.subagentTrackers.values()) {
+            try {
+                await tracker.emitShutdownRecords();
+            }
+            catch (e) {
+                warn(`shutdown sub-agent records failed for ${tracker.zcodeSid}: ` +
                     `${e instanceof Error ? e.message : String(e)}`);
             }
         }
@@ -576,26 +618,49 @@ export class ZcodeAcpServer {
      * the bridge on a notification failure.
      */
     async notifyByZcodeSid(zcodeSid, update) {
+        return this.notifyMethodByZcodeSid(zcodeSid, "session/update", (alias) => ({
+            sessionId: alias,
+            update,
+        }));
+    }
+    /**
+     * Push an ACP EXTENSION notification (a method outside the ACP spec) to every
+     * client attached to this conversation, from outside a request handler.
+     *
+     * This is the vendor-notification channel: editors that do not know the
+     * method ignore unknown notifications, while a host that understands it (the
+     * Paseo plugin's `AcpTransformer.notification` hook) can turn it into native
+     * UI. Used for `_zcode/subagent` snapshots. Same delivery rules as
+     * notifyByZcodeSid: per-alias fan-out, replay-guard serialized, never throws.
+     */
+    async notifyVendorByZcodeSid(zcodeSid, method, params) {
+        return this.notifyMethodByZcodeSid(zcodeSid, method, (alias) => ({
+            ...params,
+            acpSessionId: alias,
+        }));
+    }
+    /**
+     * Shared delivery path for out-of-band notifications: resolve the acp_sid,
+     * emit once per attached alias (a client holding this conversation under
+     * another ACP id would otherwise silently starve), serialized through the
+     * replay guard. Never throws — callers run in the event loop.
+     */
+    async notifyMethodByZcodeSid(zcodeSid, method, paramsFor) {
         if (this.clients.size === 0)
             return false;
         const acpSid = this.resolveAcpSid(zcodeSid);
         if (!acpSid)
             return false;
         try {
-            // Broadcast notify swallows per-client failures internally (warn only).
-            // Serialized through the replay guard so a background emission queues
-            // behind an in-flight replay batch for the same session. Emitted per
-            // attached alias (sessionAliases) so a client holding this conversation
-            // under a different ACP id receives it too.
             let sent = false;
             for (const alias of this.sessionAliases(acpSid)) {
-                await enqueueSessionSend(alias, () => this.clients.broadcast().notify("session/update", { sessionId: alias, update }));
+                await enqueueSessionSend(alias, () => this.clients.broadcast().notify(method, paramsFor(alias)));
                 sent = true;
             }
             return sent;
         }
         catch (e) {
-            log(`notifyByZcodeSid: session/update failed: ${e instanceof Error ? e.message : String(e)}`);
+            log(`${method}: notify failed: ${e instanceof Error ? e.message : String(e)}`);
             return false;
         }
     }

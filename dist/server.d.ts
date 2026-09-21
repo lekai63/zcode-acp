@@ -10,6 +10,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 import { ZcodeBackend } from "./backend/index.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { SandboxRestartBatcher } from "./handlers/sandbox-allow.js";
+import { SubagentTracker } from "./handlers/subagents.js";
 import { ClientRegistry } from "./remote/broadcast.js";
 /** Client capabilities advertised in the initialize request. */
 export interface ClientCapabilities {
@@ -343,6 +344,13 @@ export declare class ZcodeAcpServer {
      */
     readonly backgroundListenerBackend: Map<string, ZcodeBackend>;
     /**
+     * Per-session (zcodeSid) sub-agent trackers. Registered at the same site and
+     * with the same lifetime as the background-task listener, so an `Agent`/`Task`
+     * dispatch that outlives its turn keeps reporting. Each tracker publishes
+     * `_zcode/subagent` vendor notifications (see handlers/subagents.ts).
+     */
+    readonly subagentTrackers: Map<string, SubagentTracker>;
+    /**
      * Sessions (zcodeSid) whose background NOTIFICATION turn (the model
      * summarising a finished background task) is currently running, → start
      * time. Maintained by BackgroundTaskListener; read by the prompt path to
@@ -474,6 +482,14 @@ export declare class ZcodeAcpServer {
      */
     ensureBackgroundListener(zcodeSid: string): BackgroundTaskListener;
     /**
+     * Ensure a sub-agent tracker is registered for the session. Idempotent, and
+     * re-registers on a replaced backend instance exactly like
+     * ensureBackgroundListener. Called from that same registration site.
+     */
+    ensureSubagentTracker(zcodeSid: string): SubagentTracker;
+    /** The live backend instance, or null when none was spawned yet. */
+    currentBackend(): ZcodeBackend | null;
+    /**
      * Terminal records for in-flight background tasks before the backend
      * subprocess is torn down — the CLI's in-memory task registry dies silently
      * with the adapter, so without this the client's task cards hang in
@@ -502,6 +518,24 @@ export declare class ZcodeAcpServer {
      * the bridge on a notification failure.
      */
     notifyByZcodeSid(zcodeSid: string, update: acp.SessionUpdate): Promise<boolean>;
+    /**
+     * Push an ACP EXTENSION notification (a method outside the ACP spec) to every
+     * client attached to this conversation, from outside a request handler.
+     *
+     * This is the vendor-notification channel: editors that do not know the
+     * method ignore unknown notifications, while a host that understands it (the
+     * Paseo plugin's `AcpTransformer.notification` hook) can turn it into native
+     * UI. Used for `_zcode/subagent` snapshots. Same delivery rules as
+     * notifyByZcodeSid: per-alias fan-out, replay-guard serialized, never throws.
+     */
+    notifyVendorByZcodeSid(zcodeSid: string, method: string, params: Record<string, unknown>): Promise<boolean>;
+    /**
+     * Shared delivery path for out-of-band notifications: resolve the acp_sid,
+     * emit once per attached alias (a client holding this conversation under
+     * another ACP id would otherwise silently starve), serialized through the
+     * replay guard. Never throws — callers run in the event loop.
+     */
+    private notifyMethodByZcodeSid;
     /** Whether the client declared `_meta.terminal_output` (Zed's Bash UI hook). */
     supportsTerminalOutput(): boolean;
     /**
