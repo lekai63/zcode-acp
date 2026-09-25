@@ -135,9 +135,7 @@ export interface Messages {
     /** `/mcp` live health panel (backend mcp/list mode:"status"). */
     mcpHealthHeader: (count: number) => string;
     mcpHealthTools: (count: number) => string;
-    /** Turn-end status line (`turn.completed` resultType + cacheStats). */
-    turnCompleted: string;
-    turnCompletedCache: (cached: number, total: number, cacheRead?: string) => string;
+    /** Turn-end warning line for non-success resultTypes (`turn.completed`). */
     turnStoppedEarly: (resultType: string) => string;
     /** Editor slash-command menu: localized descriptions for the static
      *  commands (names and argument hints stay as-is — they are tokens). */

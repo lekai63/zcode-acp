@@ -153,8 +153,6 @@ const zh = {
     mcpFooter: "MCP 工具会在需要时由模型自动调用。",
     mcpHealthHeader: (n) => `📡 MCP 服务器 (${n}) · 后端状态`,
     mcpHealthTools: (n) => `${n} 个工具`,
-    turnCompleted: "✓ 已完成",
-    turnCompletedCache: (c, t, r) => `✓ 已完成 · 缓存 ${c}/${t} 条消息${r ? ` · ${r} 缓存读取 token` : ""}`,
     turnStoppedEarly: (rt) => `⚠ 提前结束：${rt}`,
     slashCommandDescriptions: {
         auto: "自治目标循环：开始、查看、暂停、恢复、停止",
@@ -277,8 +275,6 @@ const en = {
     mcpFooter: "MCP tools are auto-invoked by the model when needed.",
     mcpHealthHeader: (n) => `📡 MCP Servers (${n}) · backend status`,
     mcpHealthTools: (n) => `${n} tools`,
-    turnCompleted: "✓ completed",
-    turnCompletedCache: (c, t, r) => `✓ completed · cache ${c}/${t} messages${r ? ` · ${r} cache-read tokens` : ""}`,
     turnStoppedEarly: (rt) => `⚠ stopped early: ${rt}`,
     slashCommandDescriptions: {
         auto: "Autonomous goal loop: start, status, pause, resume, stop",
