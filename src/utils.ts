@@ -8,6 +8,9 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { appendDiary } from "./crash-guards.js";
+import { debugEnabled } from "./config/settings.js";
+
 /** ACP protocol version this server speaks. */
 export const PROTOCOL_VERSION = 1;
 
@@ -54,6 +57,16 @@ export function zcodeHomeDir(): string {
 export const ZCODE_CREDS_PATH = path.join(zcodeHomeDir(), "v2", "config.json");
 
 /**
+ * Path to the desktop's personal provider config (3.12+): the desktop writes
+ * user-added providers and models HERE, and the backend registry reads it
+ * directly — legacy config.json's provider map stopped syncing. Per call, so
+ * discovery follows a `ZCODE_HOME` change made after import (tests).
+ */
+export function zcodePersonalProviderPath(): string {
+  return path.join(zcodeHomeDir(), "v2", "provider_config.json");
+}
+
+/**
  * Path to the ZCode CLI config (skills/plugins/MCP enablement). Per call, so
  * discovery follows a `ZCODE_HOME` change made after import (tests).
  */
@@ -64,6 +77,32 @@ export function zcodeCliConfigPath(): string {
 /** Root of the ZCode plugin cache directory (per call — see above). */
 export function zcodePluginCacheDir(): string {
   return path.join(zcodeHomeDir(), "cli", "plugins", "cache");
+}
+
+/**
+ * Root of the ZCode user-scope agent definitions (`~/.zcode/agents/*.md`).
+ * Per call, so discovery follows a `ZCODE_HOME` change made after import.
+ */
+export function zcodeAgentsDir(): string {
+  return path.join(zcodeHomeDir(), "agents");
+}
+
+/**
+ * Path of the agent state file (`~/.zcode/v2/agents-state.json`): per-agent
+ * enablement plus the built-in agents' model overrides. Per call — see above.
+ */
+export function zcodeAgentsStatePath(): string {
+  return path.join(zcodeHomeDir(), "v2", "agents-state.json");
+}
+
+/** Path of the CLI agent database (`~/.zcode/cli/db/db.sqlite`) — usage stats. */
+export function zcodeUsageDbPath(): string {
+  return path.join(zcodeHomeDir(), "cli", "db", "db.sqlite");
+}
+
+/** Path of the encrypted credential store (`~/.zcode/v2/credentials.json`). */
+export function zcodeCredentialsPath(): string {
+  return path.join(zcodeHomeDir(), "v2", "credentials.json");
 }
 
 /**
@@ -111,6 +150,14 @@ export const SLASH_COMMANDS = [
   { name: "resume", description: "Resume a past session into this thread (picker popup)" },
   { name: "mcp", description: "List available MCP servers" },
   { name: "init", description: "Create or update workspace AGENTS.md instructions" },
+  // Gated commands (dynamic-workflow verdict): advertised only when the gate
+  // is enabled — index.ts filters them out at every send site.
+  {
+    name: "workflow",
+    description: "Describe a dynamic multi-step workflow for the model to run",
+    input: { hint: "<workflow description>" },
+  },
+  { name: "workflows", description: "List saved workflows and recent runs" },
 ] as const;
 
 /** Static metadata for the configOptions selects (model/mode/thought). */
@@ -164,10 +211,11 @@ export const CONFIG_DISPATCH: Record<string, { method: string; paramKey: string 
  * Never use `console.log` — it would corrupt the stdout protocol stream.
  */
 
-/** True when the user opted into verbose diagnostics.
- *  Read at call time so tests can flip it without re-importing the module. */
+/** True when the user opted into verbose diagnostics (config file `debug` or
+ *  `ZCODE_ACP_DEBUG=1`). Read at call time so tests can flip it without
+ *  re-importing the module. */
 function isDebug(): boolean {
-  return process.env.ZCODE_ACP_DEBUG === "1";
+  return debugEnabled();
 }
 
 /** Verbose diagnostic log. Only emitted when `ZCODE_ACP_DEBUG=1`. */
@@ -176,9 +224,12 @@ export function log(msg: string): void {
   process.stderr.write(`[zcode-acp] ${msg}\n`);
 }
 
-/** Warning — always emitted. For perceivable failures. */
+/** Warning — always emitted. For perceivable failures. Also lands in the
+ * daily on-disk diary (`~/.zcode/cli/log/zcode-acp-<date>.log`) so a crash
+ * that takes stderr down still leaves a trace — see crash-guards.ts. */
 export function warn(msg: string): void {
   process.stderr.write(`[zcode-acp] ${msg}\n`);
+  appendDiary(msg);
 }
 
 /**

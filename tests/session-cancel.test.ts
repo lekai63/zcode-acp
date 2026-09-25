@@ -11,6 +11,9 @@
 import type * as acp from "@agentclientprotocol/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+/// Let fire-and-forget async helpers (the async stop pair) run their microtasks.
+const flushAsync = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 import type { EventStreamListener, TurnMonitor } from "../src/backend/listener.js";
 import type { ProjectionDiffer } from "../src/translators/projection-differ.js";
 import { cancel, runEventTurn } from "../src/handlers/session.js";
@@ -37,6 +40,8 @@ function makeServer(turns: FakeTurn[], resolve: (sid: string) => string | undefi
     resolveSid: resolve,
     pendingTurns: new Map(turns.map((t, i) => [`req${i}`, t])),
     lastCancelledAt: new Map<string, number>(),
+    // stopBackendTurn consults this (compaction kill guard) — mirror the shape.
+    autoCompactInFlight: new Set<string>(),
     ensureBackend: () => ({
       send: (method: string, params: unknown) => {
         sent.push({ method, params });
@@ -52,6 +57,7 @@ describe("session/cancel handler", () => {
     const { server, sent } = makeServer([turn], (sid) => (sid === "acp_a" ? "sess_z" : undefined));
 
     await cancel(server, { sessionId: "acp_a" } as acp.CancelNotification);
+    await flushAsync();
 
     expect(turn.cancelled).toBe(true);
     expect(turn.stopSent).toBe(true);
@@ -72,6 +78,7 @@ describe("session/cancel handler", () => {
     );
 
     await cancel(server, { sessionId: "acp_a" } as acp.CancelNotification);
+    await flushAsync();
 
     expect(old.cancelled).toBe(true);
     expect(live.cancelled).toBe(true);
@@ -87,6 +94,7 @@ describe("session/cancel handler", () => {
       resolveSid: () => undefined,
       pendingTurns: new Map(),
       lastCancelledAt: new Map<string, number>(),
+      autoCompactInFlight: new Set<string>(),
       ensureBackend: () => ({ send }),
     } as unknown as ZcodeAcpServer;
 
@@ -107,6 +115,8 @@ function makeTurnFixtures() {
       pollServerRequests: () => [],
     }),
     sessionAliases: (sid: string) => [sid],
+    // stopBackendTurn consults this (compaction kill guard) — mirror the shape.
+    autoCompactInFlight: new Set<string>(),
   } as unknown as ZcodeAcpServer;
   const pollEvent = vi.fn();
   const listener = {
@@ -147,6 +157,8 @@ describe("runEventTurn: cancel exits immediately (backend ignores session/stop)"
       false,
     );
 
+    await flushAsync();
+
     expect(resp).toEqual({ stopReason: "cancelled" });
     // Guard-fired stop pair (stopSent was false), and NOT a single event consumed.
     expect(f.sent.map((s) => s.method)).toEqual(["session/stop", "v4/command"]);
@@ -181,6 +193,8 @@ describe("runEventTurn: cancel exits immediately (backend ignores session/stop)"
       false,
     );
 
+    await flushAsync();
+
     expect(resp).toEqual({ stopReason: "cancelled" });
     expect(f.sent.map((s) => s.method)).toEqual(["session/stop", "v4/command"]);
   });
@@ -200,6 +214,8 @@ describe("runEventTurn: cancel exits immediately (backend ignores session/stop)"
       turn,
       false,
     );
+
+    await flushAsync();
 
     expect(resp).toEqual({ stopReason: "cancelled" });
     expect(f.sent).toEqual([]);
@@ -274,6 +290,7 @@ describe("runEventTurn: cancel exits immediately (backend ignores session/stop)"
     // else's send — the translator ignores it and the loop does NOT fire the
     // steer report; the cancel flag ends the turn instead.
     expect(resp).toEqual({ stopReason: "cancelled" });
+    await flushAsync();
     expect(f.sent.map((s) => s.method)).toEqual(["session/stop", "v4/command"]);
     expect(f.cx.notify.mock.calls.some((c) => JSON.stringify(c).includes("重新发送"))).toBe(false);
   });

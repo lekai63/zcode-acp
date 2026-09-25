@@ -82,6 +82,9 @@ export async function dispatchEvent(
       case "UsageDelta":
         await dispatchUsageDelta(server, cx, sid, ev);
         break;
+      case "TurnInfo":
+        await dispatchTurnInfo(cx, sid, ev, chunkMsgId);
+        break;
       case "TextDelta":
         await sendSessionUpdate(cx, sid, {
           sessionUpdate: "agent_message_chunk",
@@ -186,6 +189,10 @@ function dispatchToolCallNew(
   if (termSupported) meta["terminal_info"] = { terminal_id: ev.callId };
   // Mark sub-agent dispatch cards so editors can badge them from creation.
   if (ev.tool === "Agent" || ev.tool === "Task") meta["subagent"] = true;
+  // Workflow-run visibility feed: the background-task listener suppresses a
+  // workflow run's [background] card only when the CreateWorkflow card for
+  // this callId actually reached clients.
+  server.noteDispatchedToolCall(ev.callId, ev.callId);
 
   const update: acp.SessionUpdate = {
     sessionUpdate: "tool_call",
@@ -354,6 +361,46 @@ async function dispatchTerminalUpdate(
     // callId (shouldn't happen, but defensively) starts fresh.
     server.terminalSentData.delete(ev.callId);
   }
+}
+
+/**
+ * Turn-end status line from `turn.completed` (resultType + cacheStats):
+ * success renders the prompt-cache stats (or a bare "completed" when the
+ * backend sent no cacheStats); any non-success resultType is surfaced
+ * verbatim as a warning-flavored line. Distinct messageId (chunkMsgId
+ * prefix) so editors keep it a separate message from the reply text.
+ */
+async function dispatchTurnInfo(
+  cx: acp.AgentContext,
+  acpSid: string,
+  ev: Extract<InternalEvent, { kind: "TurnInfo" }>,
+  chunkMsgId: string,
+): Promise<void> {
+  const m = messages();
+  let line: string;
+  if (ev.resultType === "success") {
+    line = ev.cacheStats
+      ? m.turnCompletedCache(
+          ev.cacheStats.cachedMessages,
+          ev.cacheStats.totalMessages,
+          ev.cacheStats.cacheReadTokens !== undefined
+            ? formatTokenCount(ev.cacheStats.cacheReadTokens)
+            : undefined,
+        )
+      : m.turnCompleted;
+  } else {
+    line = m.turnStoppedEarly(ev.resultType);
+  }
+  await sendSessionUpdate(cx, acpSid, {
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text: line },
+    messageId: `turninfo_${chunkMsgId}`,
+  });
+}
+
+/** Compact token-count rendering for status lines: 12300 → "12.3k", 999 → "999". */
+function formatTokenCount(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
 }
 
 async function dispatchUsageDelta(

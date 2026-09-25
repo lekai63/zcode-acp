@@ -97,14 +97,51 @@ ZCode CLI 内置于桌面应用中，默认不会加到 `PATH`。用 `ZCODE_BIN`
 > Get-ChildItem -Path $env:LOCALAPPDATA,$env:APPDATA,'C:\Program Files' -Recurse -Filter zcode.cjs -ErrorAction SilentlyContinue
 > ```
 
+## 用户配置文件
+
+所有用户偏好都可以统一维护在 `~/.config/zcode-acp/config.json`(或
+`$XDG_CONFIG_HOME/zcode-acp/config.json`)。逐字段优先级:**配置文件 >
+环境变量 > 内置默认值**——环境变量全部保留为回退,但推荐用文件配置
+(GUI 启动的编辑器和 hub 守护进程继承不到 shell 的环境变量)。读取是
+实时的:改完下一次使用即生效,无需重启。唯一例外是
+`interaction.timeoutMs`——与它的环境变量一样,在 bridge 启动时解析一次。
+
+```jsonc
+{
+  "lang": "zh",                           // 用户可见文案语言:"zh" | "en"
+  "debug": false,                         // 详细诊断日志(ZCODE_ACP_DEBUG=1)
+  "session": { "mode": "yolo" },          // 新会话初始 mode:plan|build|edit|yolo|auto
+  "autoCompact": { "threshold": 240000 }, // 上下文用到 N token 时自动压缩(不设 = 关闭)
+  "goal": {
+    "maxTurns": 100,                      // goal/auto 循环回合预算
+    "mode": "backend"                     // "backend" 恢复旧的后端 /goal 路由
+  },
+  "interaction": { "timeoutMs": 0 },      // 权限请求等待上限,毫秒(0 = 一直等)
+  "sandbox": { "enabled": false },        // 全局 Seatbelt 开关(项目级: sandbox.json)
+  "remote": { /* 见远程访问 */ },
+  "quota": { /* quota 卡片凭据 */ }
+}
+```
+
+非法值会在 stderr 警告一次并丢弃(环境变量回退生效),bridge 绝不改写
+该文件。
+
+刻意不进文件的是:进程态变量(`ZCODE_ACP_RESUME_SESSION`、
+`ZCODE_ACP_REMOTE_ORIGIN`、`ZCODE_ACP_REMOTE_PIN_CWD`、`ZCODE_ACP_TUI_CLI_PID`)和启动引导变量(`ZCODE_BIN`、`ZCODE_NODE`、
+`ZCODE_HOME`、`ZCODE_PROVIDER`、`ZCODE_MODEL`、
+`ZCODE_DISALLOWED_TOOLS`)——前者承载单次运行状态,后者在任何配置可读
+之前就已解析。
+
 ## 环境变量
+
+下表中所有 `ZCODE_ACP_*` 偏好类变量都有对应的配置文件字段(见
+[用户配置文件](#用户配置文件)),文件值优先。
 
 | 变量                               | 默认值           | 用途                                                                                                                                                                                                                                                                                |
 | ---------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ZCODE_BIN`                        | `zcode`          | ZCode CLI 二进制文件路径或其 `.cjs` 入口                                                                                                                                                                                                                                            |
 | `ZCODE_NODE`                       | _（自动发现）_   | 显式指定运行 `ZCODE_BIN` 的 Node 二进制（必须支持 `node:sqlite`）                                                                                                                                                                                                                   |
 | `ZCODE_MODEL`                      | _（来自 config） | 覆盖当前使用的模型 id                                                                                                                                                                                                                                                               |
-| `ZCODE_BASE_URL`                   | _（来自 config） | 覆盖 provider 的 base URL。若检测到是切换套餐残留的旧地址会自动回退为 config 的 URL——但同时导出了 `ANTHROPIC_API_KEY` 时视为用户有意指定，不再回退。默认选择凭证来源时会跳过 enabled 但 `apiKey` 为空的 provider。                                                                                                                                                                                                                                                           |
 | `ZCODE_DISALLOWED_TOOLS`            | _（Cron 工具）_  | 以空格或逗号分隔的工具名，作为 `--disallowed-tools` 传给 app-server，并与内置默认值合并——默认禁用 `CronCreate CronList CronUpdate CronDelete`（桥接层无法应答后端的 `automation/*` 客户端请求，这些工具对模型可见但必然失败，见 #192）。 |
 | `ZCODE_ENABLE_AUTOMATION_TOOLS`     | _（未设置）      | 设为 `1` 取消对 Cron* 工具的默认禁用——仅对真正实现了后端 `automation/*` 端口的宿主有意义。 |
 | `ZCODE_ACP_AUTO_COMPACT_THRESHOLD` | _（未设置）      | 触发自动压缩的绝对 token 阈值。每次回合成功完成后（`end_turn`），若 `contextUsed >= 阈值`，服务端会自动调用 `session/compact` 压缩上下文，为下一个 prompt 腾出空间。设为 `0` 或不设置则禁用（默认）。例如 `240000` 表示上下文达 24 万 token 时触发压缩。压缩目标由 ZCode 后端决定。 |

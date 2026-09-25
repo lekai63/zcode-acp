@@ -18,6 +18,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import { z } from "zod";
 
 import { accountUsageStats } from "./handlers/account.js";
+import { installCrashGuards } from "./crash-guards.js";
 import {
   cancel,
   listSessions,
@@ -35,13 +36,13 @@ import {
   setMode,
   setModel,
   setThoughtLevel,
-  updateRuntimeModelConfig,
 } from "./handlers/extensions.js";
 import { echoUserPromptToOthers, sendAvailableCommandsDeferred } from "./handlers/io.js";
 import { loadEarlier } from "./handlers/replay.js";
 import { resendPendingInteractions } from "./handlers/server-requests.js";
 import { loadPluginCommands } from "./config/plugin-commands.js";
 import { loadSkillCommands } from "./config/skill-discovery.js";
+import { filterWorkflowCommands } from "./config/workflow-gate.js";
 import { trackConnections } from "./remote/broadcast.js";
 import { parseRemoteConfig } from "./remote/config.js";
 import { startRemoteEndpoint, type RemoteEndpointHandle } from "./remote/endpoint.js";
@@ -79,6 +80,9 @@ function buildAllCommands() {
 }
 
 export async function main(): Promise<void> {
+  // Crash guards FIRST: any later async task that rejects without a catch
+  // must warn, not kill the process (the whole TUI window dies with us).
+  installCrashGuards();
   // Remote config is parsed BEFORE the server exists: a hub-incubated REPL
   // bridge (ADR-0016) arrives with ZCODE_ACP_REMOTE_PIN_CWD=1, and the pin
   // must hold from the very first session/new — not from the endpoint start.
@@ -152,6 +156,9 @@ export async function main(): Promise<void> {
  * one build, two transports.
  */
 function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof buildAllCommands>) {
+  // Exposed for the gate-aware menu catch-up (resendMenuAfterGateSettled in
+  // handlers/session.ts) — a cold bridge's menu snapshot predates the verdict.
+  server.allCommands = allCommands;
   /** Passthrough params parser for the ZCode-specific extension methods. */
   const extParams = z.object({ sessionId: z.string() }).passthrough();
 
@@ -162,15 +169,29 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("session/new", async (ctx) => {
         const result = await newSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(result.sessionId)) {
-          sendAvailableCommandsDeferred(server.clients, sid, allCommands);
+          sendAvailableCommandsDeferred(
+            server.clients,
+            sid,
+            filterWorkflowCommands(server, allCommands),
+          );
         }
         return result;
       })
       .onRequest("session/list", (ctx) => listSessions(server, ctx.params))
       .onRequest("session/resume", async (ctx) => {
-        const result = await resumeSession(server, ctx.params, server.clients.broadcast());
+        // Replays target the REQUESTING connection only (ctx.client, not the
+        // broadcast proxy): a replay is per-client rendering state, and
+        // fanning it out appends the whole history to every OTHER attached
+        // client's transcript at the bottom — the "replay disorder" report
+        // (editor + TUI + app sharing one bridge through the hub). Live turn
+        // updates keep fanning out via prompt()'s broadcast cx.
+        const result = await resumeSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
-          sendAvailableCommandsDeferred(server.clients, sid, allCommands);
+          sendAvailableCommandsDeferred(
+            server.clients,
+            sid,
+            filterWorkflowCommands(server, allCommands),
+          );
         }
         // A client that (re)connects catches up via resume/load; any interaction
         // request still waiting for an answer is re-sent to it so a question
@@ -179,9 +200,14 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
         return result;
       })
       .onRequest("session/load", async (ctx) => {
-        const result = await loadSession(server, ctx.params, server.clients.broadcast());
+        // Targeted replay — see the session/resume comment above.
+        const result = await loadSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
-          sendAvailableCommandsDeferred(server.clients, sid, allCommands);
+          sendAvailableCommandsDeferred(
+            server.clients,
+            sid,
+            filterWorkflowCommands(server, allCommands),
+          );
         }
         resendPendingInteractions(server, ctx.client, ctx.params.sessionId);
         return result;
@@ -189,12 +215,13 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       // Tail-replay pagination (non-standard; Proposal 0001) — params stay
       // top-level because the parser below is ours, unlike spec methods where
       // bridge extensions must ride in `_meta.zcode`.
+      // Targeted replay — see the session/resume comment above.
       .onRequest(
         "session/load_earlier",
         z
           .object({ sessionId: z.string(), before: z.string(), limit: z.number().optional() })
           .passthrough(),
-        (ctx) => loadEarlier(server, ctx.params, server.clients.broadcast()),
+        (ctx) => loadEarlier(server, ctx.params, ctx.client),
       )
       // Account-level plan quota for remote clients (non-standard; Proposal
       // 0002). Pull-only, no session required; errors carry the failure kind in
@@ -234,9 +261,9 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("session/setThoughtLevel", extParams, (ctx) =>
         setThoughtLevel(server, ctx.params, server.clients.broadcast()),
       )
-      .onRequest("session/updateRuntimeModelConfig", extParams, (ctx) =>
-        updateRuntimeModelConfig(server, ctx.params, server.clients.broadcast()),
-      )
+      // session/updateRuntimeModelConfig was removed 2026-09: the method is
+      // absent from the app-server 0.16.9 enum (every call answered -32601);
+      // setModel + applyModelSwitch cover the switch path on all builds.
       .onRequest("session/setModel", extParams, (ctx) =>
         setModel(server, ctx.params, server.clients.broadcast()),
       )
@@ -288,6 +315,10 @@ export function serveIdleDecision(
  * endpoint exits instead of degrading.
  */
 export async function runHeadless(): Promise<void> {
+  // Crash guards FIRST, mirroring main(): a serve bridge is a long-lived hub
+  // child driving live remote sessions — a stray unhandled rejection must
+  // warn, not kill every session it hosts.
+  installCrashGuards();
   const remoteConfig = parseRemoteConfig();
   if (!remoteConfig) {
     warn(

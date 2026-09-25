@@ -137,4 +137,64 @@ describe("loadUserConfig", () => {
     writeConfig(JSON.stringify({ remote: { enabled: true, futureField: "x" }, other: 1 }));
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
   });
+
+  it("parses the behavior sections (lang prefix-normalized, sections trimmed)", () => {
+    writeConfig(
+      JSON.stringify({
+        lang: "zh-CN",
+        debug: true,
+        session: { mode: "plan" },
+        autoCompact: { threshold: 240000 },
+        goal: { maxTurns: 7, mode: "backend" },
+        interaction: { timeoutMs: 0 },
+        sandbox: { enabled: true },
+        tui: { stats: "tokens,context" },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      lang: "zh",
+      debug: true,
+      session: { mode: "plan" },
+      autoCompact: { threshold: 240000 },
+      goal: { maxTurns: 7, mode: "backend" },
+      interaction: { timeoutMs: 0 },
+      sandbox: { enabled: true },
+      tui: { stats: "tokens,context" },
+    });
+  });
+
+  it("accepts an empty tui.stats (hide the dock) but drops non-strings", () => {
+    writeConfig(JSON.stringify({ tui: { stats: "" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ tui: { stats: "" } });
+    writeConfig(JSON.stringify({ tui: { stats: 7 } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({});
+  });
+
+  it("drops every invalid behavior value, keeps valid siblings", () => {
+    writeConfig(
+      JSON.stringify({
+        lang: "fr",
+        debug: "yes",
+        session: { mode: "wat" },
+        autoCompact: { threshold: -3 },
+        goal: { maxTurns: 0, mode: "driver" },
+        interaction: { timeoutMs: -1 },
+        sandbox: { enabled: 1 },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({});
+  });
+
+  it("non-object sections and empty shells read as absent (sandbox false survives)", () => {
+    writeConfig(
+      JSON.stringify({
+        session: "oops",
+        goal: [],
+        autoCompact: {},
+        interaction: { timeoutMs: 1.5 }, // non-integer → dropped → empty shell
+        sandbox: { enabled: false }, // explicit false is a VALUE, not a shell
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ sandbox: { enabled: false } });
+  });
 });
