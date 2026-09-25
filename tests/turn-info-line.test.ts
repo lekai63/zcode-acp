@@ -1,8 +1,9 @@
 /**
- * Turn-end status line — `turn.completed` resultType + cacheStats surfaced as
- * one session/update text line. Covers the full path: EventTranslator extracts
- * the fields onto a TurnInfo internal event, dispatchEvent renders it as an
- * agent_message_chunk (success → cache stats, non-success → resultType verbatim).
+ * Turn-end status — `turn.completed` resultType handling. Successful turns are
+ * SILENT (the old "✓ completed · cache …" agent_message_chunk persisted as a
+ * timeline message after every turn — pure noise); only non-success resultTypes
+ * surface as one warning-flavored line. Covers the full path: EventTranslator
+ * extracts the fields onto a TurnInfo internal event, dispatchEvent renders it.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -41,7 +42,7 @@ function textOf(u: Record<string, unknown>): string {
 }
 
 describe("dispatchEvent TurnInfo rendering", () => {
-  it("success + full cacheStats renders cache counts and compacted cache-read tokens", async () => {
+  it("success + full cacheStats stays silent — no timeline message", async () => {
     const { cx, sent } = mockContext();
     await dispatchEvent(
       new ZcodeAcpServer(),
@@ -59,15 +60,10 @@ describe("dispatchEvent TurnInfo rendering", () => {
       },
       "chunk-1",
     );
-    expect(sent).toHaveLength(1);
-    const u = sent[0]!;
-    expect(u["sessionUpdate"]).toBe("agent_message_chunk");
-    expect(textOf(u)).toBe("✓ completed · cache 42/45 messages · 12.3k cache-read tokens");
-    // Distinct messageId so the line stays a separate message from the reply.
-    expect(u["messageId"]).toBe("turninfo_chunk-1");
+    expect(sent).toHaveLength(0);
   });
 
-  it("success + cacheStats without cacheReadTokens omits the token part", async () => {
+  it("success + cacheStats without cacheReadTokens stays silent too", async () => {
     const { cx, sent } = mockContext();
     await dispatchEvent(
       new ZcodeAcpServer(),
@@ -80,10 +76,10 @@ describe("dispatchEvent TurnInfo rendering", () => {
       },
       "chunk-2",
     );
-    expect(textOf(sent[0]!)).toBe("✓ completed · cache 4/10 messages");
+    expect(sent).toHaveLength(0);
   });
 
-  it("success without cacheStats renders the bare completion line", async () => {
+  it("success without cacheStats stays silent (no bare completion line)", async () => {
     const { cx, sent } = mockContext();
     await dispatchEvent(
       new ZcodeAcpServer(),
@@ -92,7 +88,7 @@ describe("dispatchEvent TurnInfo rendering", () => {
       { kind: "TurnInfo", resultType: "success" },
       "chunk-3",
     );
-    expect(textOf(sent[0]!)).toBe("✓ completed");
+    expect(sent).toHaveLength(0);
   });
 
   it("non-success resultType is named verbatim in a warning-flavored line", async () => {
@@ -104,7 +100,12 @@ describe("dispatchEvent TurnInfo rendering", () => {
       { kind: "TurnInfo", resultType: "error_max_budget" },
       "chunk-4",
     );
-    expect(textOf(sent[0]!)).toBe("⚠ stopped early: error_max_budget");
+    expect(sent).toHaveLength(1);
+    const u = sent[0]!;
+    expect(u["sessionUpdate"]).toBe("agent_message_chunk");
+    expect(textOf(u)).toBe("⚠ stopped early: error_max_budget");
+    // Distinct messageId so the line stays a separate message from the reply.
+    expect(u["messageId"]).toBe("turninfo_chunk-4");
   });
 
   it("cancelled resultType surfaces as stopped early too", async () => {
@@ -121,7 +122,7 @@ describe("dispatchEvent TurnInfo rendering", () => {
 });
 
 describe("translate → dispatch end-to-end", () => {
-  it("emits the status line as the LAST session/update of the turn", async () => {
+  it("emits only the reply text — no status line after a successful turn", async () => {
     const { cx, sent } = mockContext();
     const server = new ZcodeAcpServer();
     const t = new EventTranslator();
@@ -150,12 +151,12 @@ describe("translate → dispatch end-to-end", () => {
     for (const iev of events) {
       await dispatchEvent(server, cx, SID, iev, "chunk-e2e");
     }
-    const last = sent[sent.length - 1]!;
-    expect(last["sessionUpdate"]).toBe("agent_message_chunk");
-    expect(textOf(last)).toBe("✓ completed · cache 42/45 messages · 12.3k cache-read tokens");
-    // The reply text streamed before it, untouched. No usage_update here:
-    // turn.completed's usage is cumulative consumption, never the context
-    // meter (#228) — occupancy comes from the reconciliation diff instead.
-    expect(sent).toHaveLength(2); // agent text + turn line
+    // The reply text streams through untouched; the turn line is gone. No
+    // usage_update here either: turn.completed's usage is cumulative
+    // consumption, never the context meter (#228) — occupancy comes from the
+    // reconciliation diff instead.
+    expect(sent).toHaveLength(1); // agent text only
+    expect(sent[0]!["sessionUpdate"]).toBe("agent_message_chunk");
+    expect(textOf(sent[0]!)).toBe("reply body");
   });
 });

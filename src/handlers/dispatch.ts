@@ -364,11 +364,12 @@ async function dispatchTerminalUpdate(
 }
 
 /**
- * Turn-end status line from `turn.completed` (resultType + cacheStats):
- * success renders the prompt-cache stats (or a bare "completed" when the
- * backend sent no cacheStats); any non-success resultType is surfaced
- * verbatim as a warning-flavored line. Distinct messageId (chunkMsgId
- * prefix) so editors keep it a separate message from the reply text.
+ * Turn-end status from `turn.completed` (resultType + cacheStats). Successful
+ * turns stay SILENT — the "✓ completed · cache …" line is an agent_message_chunk,
+ * so it lands in the editor as a persisted timeline message after every turn
+ * (noise in history, nothing actionable). Only non-success resultTypes surface,
+ * verbatim, as a warning-flavored line. Distinct messageId (chunkMsgId prefix)
+ * so editors keep it a separate message from the reply text.
  */
 async function dispatchTurnInfo(
   cx: acp.AgentContext,
@@ -376,31 +377,13 @@ async function dispatchTurnInfo(
   ev: Extract<InternalEvent, { kind: "TurnInfo" }>,
   chunkMsgId: string,
 ): Promise<void> {
+  if (ev.resultType === "success") return;
   const m = messages();
-  let line: string;
-  if (ev.resultType === "success") {
-    line = ev.cacheStats
-      ? m.turnCompletedCache(
-          ev.cacheStats.cachedMessages,
-          ev.cacheStats.totalMessages,
-          ev.cacheStats.cacheReadTokens !== undefined
-            ? formatTokenCount(ev.cacheStats.cacheReadTokens)
-            : undefined,
-        )
-      : m.turnCompleted;
-  } else {
-    line = m.turnStoppedEarly(ev.resultType);
-  }
   await sendSessionUpdate(cx, acpSid, {
     sessionUpdate: "agent_message_chunk",
-    content: { type: "text", text: line },
+    content: { type: "text", text: m.turnStoppedEarly(ev.resultType) },
     messageId: `turninfo_${chunkMsgId}`,
   });
-}
-
-/** Compact token-count rendering for status lines: 12300 → "12.3k", 999 → "999". */
-function formatTokenCount(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
 }
 
 async function dispatchUsageDelta(
