@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { execFileSync } from "node:child_process";
-import { log } from "../utils.js";
+import { log, warn, zcodePersonalProviderPath } from "../utils.js";
 /** `which bin` — resolve a binary on PATH without external deps. */
 function whichSync(bin) {
     try {
@@ -179,10 +179,48 @@ export function builtinProviderEnv(entryArg) {
     const found = candidates.find((c) => existsSync(c));
     if (!found)
         return {};
-    const personal = path.join(os.homedir(), ".zcode", "v2", "provider_config.json");
+    const personal = zcodePersonalProviderPath();
     return existsSync(personal)
         ? { [BUILTIN_PROVIDER_ENV]: found, [PERSONAL_PROVIDER_ENV]: personal }
         : { [BUILTIN_PROVIDER_ENV]: found };
+}
+/**
+ * Translate the bridge's `ZCODE_HOME` into the backend's own data-root
+ * spelling for the spawn.
+ *
+ * The bridge reads the ZCode data tree through `ZCODE_HOME` (it replaces
+ * `~/.zcode` outright — utils.ts zcodeHomeDir), but the backend's contract is
+ * `ZCODE_DATA_BASE_DIR`: the PARENT of `.zcode`
+ * (packages/services/src/paths.ts:11,33-45 — getZCodeDataRootDir() is
+ * `join(getDataBaseDir(), ".zcode")`; provider-runtime-env.ts:60,76 reads the
+ * same var). Without the translation, a bridge running against an isolated
+ * tree discovers skills/MCP/credentials there while the spawned backend still
+ * reads the real `~/.zcode` — split-brain. An unset ZCODE_HOME returns {} so
+ * any ambient ZCODE_DATA_BASE_DIR passes through untouched.
+ *
+ * The translation only EXISTS when the tree's basename is `.zcode` — the
+ * backend unconditionally appends `.zcode` to the base dir, so a differently
+ * named tree cannot be projected onto it at all. dirname() of such a path
+ * would point the backend at a sibling `.zcode` that may belong to someone
+ * else entirely; leaving the env unset (backend reads the ambient default)
+ * and warning is the honest failure — the mismatch is visible instead of
+ * silently wired to the wrong tree.
+ */
+let warnedNonZcodeHome = false;
+export function zcodeDataBaseDirEnv() {
+    const home = process.env.ZCODE_HOME?.trim();
+    if (!home)
+        return {};
+    const resolved = path.resolve(home);
+    if (path.basename(resolved) !== ".zcode") {
+        if (!warnedNonZcodeHome) {
+            warnedNonZcodeHome = true;
+            warn(`ZCODE_HOME='${resolved}' does not end in '.zcode' — the backend only understands a ` +
+                `base dir + '.zcode', so it will NOT see this tree (leaving ZCODE_DATA_BASE_DIR unset)`);
+        }
+        return {};
+    }
+    return { ZCODE_DATA_BASE_DIR: path.dirname(resolved) };
 }
 /**
  * Happy Eyeballs (`autoSelectFamily`, on by default since Node 20.13) gives

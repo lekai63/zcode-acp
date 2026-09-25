@@ -14,7 +14,9 @@
  *
  * Per-process plumbing (ZCODE_ACP_REMOTE_ORIGIN, _PIN_CWD,
  * ZCODE_ACP_RESUME_SESSION) is deliberately NOT file-configurable — those
- * carry per-request/per-role state, not user preference.
+ * carry per-request/per-role state, not user preference. Bootstrap-time
+ * variables (ZCODE_BIN, ZCODE_NODE, ZCODE_HOME, ZCODE_PROVIDER, …) are
+ * resolved once at startup and stay env-only for the same reason.
  */
 /** Terminal incubation preferences for remote session-create (ADR-0016). */
 export interface TerminalPrefs {
@@ -48,10 +50,63 @@ export interface QuotaUserConfig {
     opencodeGoWorkspaceId?: string;
     /** Opencode Go `auth` cookie value (`Fe26.2**…`). */
     opencodeGoAuthCookie?: string;
+    /** Opencode Go `__Host-console_session` cookie value (`st_…`) — required
+     * since the 2026-09 console migration (the API 401s the auth cookie alone). */
+    opencodeGoSessionToken?: string;
+}
+/** The `session` section: defaults for newly created sessions. */
+export interface SessionUserConfig {
+    /** Mode a new session starts in (plan/build/edit/yolo/auto — the backend's own modes). */
+    mode?: string;
+}
+/** The `autoCompact` section: threshold-based context compaction. */
+export interface AutoCompactUserConfig {
+    /** Absolute token count that triggers compaction after a turn (0/unset = disabled). */
+    threshold?: number;
+}
+/** The `goal` section: bridge-driven goal/auto loop knobs. */
+export interface GoalUserConfig {
+    /** Hard round budget before a pause (default 100). */
+    maxTurns?: number;
+    /** "backend" restores the legacy backend goal mode; anything else uses the bridge loop. */
+    mode?: "backend";
+}
+/** The `interaction` section: server→client request behavior. */
+export interface InteractionUserConfig {
+    /** Wait cap in ms for permission/elicitation requests (0 = wait forever). */
+    timeoutMs?: number;
+}
+/** The `tui` section: Martty TUI presentation preferences. */
+export interface TuiUserConfig {
+    /**
+     * Composer-dock segment filter for the TUI's stats view (martty's
+     * `DSH_TUI_STATS` vocabulary): comma-separated segment ids in render
+     * order — `tokens`, `context`, `counts`, `cache`, `time`, `speed`.
+     * `all` spells the full dock out; `none`/`off`/empty hides every
+     * segment; unset keeps the full dock. File-configured so hub-incubated
+     * TUI windows (whose shell inherits launchd's env, not the user's
+     * shell) see the same dock as a direct `zcode-acp` launch.
+     */
+    stats?: string;
+}
+/** The `sandbox` section: global Seatbelt arming switch (per-project stays in sandbox.json). */
+export interface SandboxUserConfig {
+    /** true = arm the sandbox globally (same as ZCODE_ACP_SANDBOX=1). */
+    enabled?: boolean;
 }
 export interface UserConfig {
     remote?: RemoteUserConfig;
     quota?: QuotaUserConfig;
+    /** Language of user-facing bridge strings ("zh" | "en"). */
+    lang?: "zh" | "en";
+    /** Verbose diagnostic logging (same as ZCODE_ACP_DEBUG=1). */
+    debug?: boolean;
+    session?: SessionUserConfig;
+    autoCompact?: AutoCompactUserConfig;
+    goal?: GoalUserConfig;
+    interaction?: InteractionUserConfig;
+    sandbox?: SandboxUserConfig;
+    tui?: TuiUserConfig;
 }
 /** Resolve the config file path: $XDG_CONFIG_HOME/zcode-acp or ~/.config/zcode-acp. */
 export declare function userConfigPath(env?: NodeJS.ProcessEnv): string;

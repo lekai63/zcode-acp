@@ -205,8 +205,21 @@ export function zcodePermissionToAcp(params, acpSid) {
  * text defined by the backend, so this set mirrors the backend's naming.
  * Any optionId not in this set is treated as deny (fail-safe). */
 const ALLOW_OPTION_IDS = new Set(["allow", "allow_once", "allow_always", "allow_project"]);
-/** Convert an ACP requestPermission response → zcode {decision, reason?}. */
-export function acpPermissionResponseToZcode(acpResp) {
+/**
+ * Convert an ACP requestPermission response → the zcode interaction response.
+ *
+ * The backend's options each carry the authoritative `response` object
+ * (`zcodePermissionOptionSchema`, zcode-protocol/index.ts:589-597): the
+ * "Always allow in this project" option ships `permissionUpdates` that the
+ * runtime persists (core/src/tool/executor/permission-flow.ts:359-366), and
+ * deny ships the normalized STOP reason. Echoing the selected option's
+ * response verbatim is what the desktop host does
+ * (interaction-broker.ts:70-124) — synthesizing our own {decision} instead
+ * drops the persistent rules and degrades "always allow" to a one-shot allow.
+ *
+ * Options without a `response` (older builds) fall back to the allow-id set.
+ */
+export function acpPermissionResponseToZcode(acpResp, options) {
     if (!acpResp || typeof acpResp !== "object") {
         return { decision: "deny", reason: "invalid client response" };
     }
@@ -214,6 +227,19 @@ export function acpPermissionResponseToZcode(acpResp) {
     if (outcome.outcome === "cancelled")
         return { decision: "deny", reason: "cancelled by user" };
     const optionId = outcome.optionId ?? "";
+    const selected = (options ?? []).find((o) => o.optionId === optionId);
+    const resp = selected?.response;
+    if (resp && (resp.decision === "allow" || resp.decision === "deny")) {
+        const echoed = {
+            decision: resp.decision,
+        };
+        if (typeof resp.reason === "string")
+            echoed.reason = resp.reason;
+        if (Array.isArray(resp.permissionUpdates) && resp.permissionUpdates.length > 0) {
+            echoed.permissionUpdates = resp.permissionUpdates;
+        }
+        return echoed;
+    }
     if (ALLOW_OPTION_IDS.has(optionId))
         return { decision: "allow" };
     return { decision: "deny", reason: `rejected (${optionId})` };

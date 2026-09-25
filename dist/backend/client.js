@@ -32,6 +32,28 @@ export class ZcodeBackend {
     sendIdCounter = 1_000_000_000;
     /** Watchdog process that kills the zcode group if this bridge dies (SIGKILL). */
     watchdog = null;
+    /**
+     * Arrival-time responder for `interaction/requestProviderRuntimeHeaders`.
+     * The backend asks before EVERY model request on a zhipu-account provider,
+     * and a request that lands while no turn loop is polling the server-request
+     * queue (compact's internal turn, session/goal set, any backend-owned
+     * generation) dies at the backend's 180s cap as "Captcha verification
+     * request timed out" — auto-compact silently failed that way (observed
+     * 2026-09-19). Wired by ZcodeAcpServer.ensureBackend to the coding-plan key
+     * answer; returning false falls back to queueing (turn-loop handling).
+     */
+    providerRuntimeHeadersResponder;
+    /**
+     * Arrival-time hook for compact terminal states. `session/compact` runs its
+     * internal turn in the background and NEVER reports failure on the RPC —
+     * the outcome only surfaces as a `state.updated` notification whose reason
+     * is one of `session_compacted` / `session_compact_cancelled` /
+     * `session_compact_failed` (source: server-operations.ts
+     * `runCompactTurnInBackground` → `afterStateMutation`). Wired by
+     * ZcodeAcpServer.ensureBackend to record per-session outcomes so compact()
+     * can report real failure instead of assuming success from the RPC ack.
+     */
+    onCompactOutcome;
     constructor(argv, env) {
         this.proc = spawn(argv[0], argv.slice(1), {
             stdio: ["pipe", "pipe", "ignore"],
@@ -154,6 +176,11 @@ export class ZcodeBackend {
                     askUserQuestionAutoResolutionEnabled: false,
                 });
             }
+            else if (method === "interaction/requestProviderRuntimeHeaders" &&
+                this.providerRuntimeHeadersResponder?.(id, (msg.params ?? {}))) {
+                // Answered at arrival — see providerRuntimeHeadersResponder. This is
+                // what keeps compact's internal model turn alive outside any turn loop.
+            }
             else {
                 this.serverRequests.push({
                     id,
@@ -175,6 +202,10 @@ export class ZcodeBackend {
                 //   { patch: {mode, model, thoughtLevel, …}, reason, revision, sessionId }
                 // Wrap as a ZcodeEvent so it flows through the same listener pipeline.
                 const params = (msg.params ?? {});
+                const reason = typeof params["reason"] === "string" ? params["reason"] : "";
+                if (reason.startsWith("session_compact_") && params["sessionId"] !== undefined) {
+                    this.onCompactOutcome?.(String(params["sessionId"]), reason);
+                }
                 const ev = {
                     sessionId: String(params.sessionId ?? ""),
                     seq: 0,
@@ -182,6 +213,12 @@ export class ZcodeBackend {
                     payload: params,
                 };
                 this.dispatchEvent(ev);
+            }
+            else if (method === "interaction/providerRuntimeHeadersCancelled") {
+                // The backend aborted a pending runtime-headers refresh (turn cancel,
+                // 180s cap). Our responder answers at frame arrival, so the reply is
+                // already out and there is nothing to un-answer — acknowledge only.
+                log(`provider runtime headers ask cancelled by backend: ${JSON.stringify(msg.params ?? {})}`);
             }
             // Other notifications are currently ignored (process/resourceSample, …).
         }

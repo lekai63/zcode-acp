@@ -31,6 +31,15 @@ interface ProviderEntry {
     models?: ProviderModelsJson;
 }
 /**
+ * A model's declaration from provider_config.json only — the lookup for
+ * models that exist in the desktop's personal config but not (yet) in legacy
+ * config.json. Null when the personal config is absent or lacks the model.
+ */
+export declare function personalModelSpec(providerId: string, modelId: string): {
+    contextWindow?: number;
+    reasoningValues?: string[];
+} | null;
+/**
  * Fallback defaults for when config.json is unreadable or has no enabled
  * provider — keeps a freshly-installed editor functional. Must stay in sync
  * with the model the app ships first in its provider list.
@@ -60,7 +69,12 @@ export interface ModelRef {
  */
 export declare function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean;
 /**
- * Collect models from config.json for the dropdown.
+ * Collect models from config.json for the dropdown, UNIONED with the desktop's
+ * provider_config.json (3.12+): models the user added in the desktop app land
+ * there and never reach legacy config.json, so without the merge the dropdown
+ * silently misses them (observed 2026-09). config.json stays authoritative for
+ * provider enablement/credentials; the personal config contributes model ids
+ * per provider, plus whole providers it describes and config.json does not.
  */
 export declare function loadAllModels(): ModelRef[];
 /** Look up a provider entry by id (any provider, not just enabled).
@@ -69,7 +83,9 @@ export declare function loadAllModels(): ModelRef[];
  *  config.json keeps the legacy `builtin:<family>-<plan>` — normalize before
  *  lookup so both spellings resolve. */
 export declare function findProviderConfig(providerId: string): ProviderEntry | null;
-/** Read the context-window size for a provider+model from config.json. */
+/** Read the context-window size for a provider+model: config.json first, then
+ *  the desktop's provider_config.json (models added there carry
+ *  `config.properties.contextWindow` and never reach config.json). */
 export declare function modelContextWindow(providerId: string, modelId: string): number;
 /** Builtin providerIds are prefixed with `builtin:` (e.g. `builtin:bigmodel`). */
 export declare function isBuiltinProvider(providerId: string): boolean;
@@ -118,10 +134,20 @@ export declare function buildConfigOptions(server: ZcodeAcpServer, zcodeSid: str
  * Returns `{ kind, currentValue, options }` so the caller can emit the update
  * notifications, or null when the configId is unknown / model switch fails.
  */
-export declare function setConfigOption(server: ZcodeAcpServer, zcodeSid: string, configId: string, value: string): Promise<{
+export declare function setConfigOption(server: ZcodeAcpServer, zcodeSid: string, configId: string, value: string, acpSid?: string): Promise<{
     kind: "model" | "mode" | "thought";
     currentValue: string;
 } | null>;
+/**
+ * Record the session's model/thought choice: in-memory per zcodeSid (read by
+ * the post-resume re-assert) and durably per acpSid in the lazy-alias store
+ * (read back after a bridge restart). See LazySessionRecord.modelChoice for
+ * why the backend's own persistence cannot be trusted here.
+ */
+export declare function rememberModelChoice(server: ZcodeAcpServer, acpSid: string | undefined, zcodeSid: string, patch: {
+    model?: string;
+    thought?: string;
+}): void;
 /** Emit a config_option_update (+ current_mode_update for mode) after a change.
  *  Returns the rebuilt options (+ the advertised currentModeId for mode) so the
  *  caller can include them in the response / mirror lastMode.

@@ -55,8 +55,21 @@ export declare function zcodePermissionToAcp(params: ZcodeInteractionPermissionP
     sessionId: string;
     toolCall: PermissionToolCall;
 } | null;
-/** Convert an ACP requestPermission response → zcode {decision, reason?}. */
-export declare function acpPermissionResponseToZcode(acpResp: unknown): Extract<ZcodeInteractionResponse, {
+/**
+ * Convert an ACP requestPermission response → the zcode interaction response.
+ *
+ * The backend's options each carry the authoritative `response` object
+ * (`zcodePermissionOptionSchema`, zcode-protocol/index.ts:589-597): the
+ * "Always allow in this project" option ships `permissionUpdates` that the
+ * runtime persists (core/src/tool/executor/permission-flow.ts:359-366), and
+ * deny ships the normalized STOP reason. Echoing the selected option's
+ * response verbatim is what the desktop host does
+ * (interaction-broker.ts:70-124) — synthesizing our own {decision} instead
+ * drops the persistent rules and degrades "always allow" to a one-shot allow.
+ *
+ * Options without a `response` (older builds) fall back to the allow-id set.
+ */
+export declare function acpPermissionResponseToZcode(acpResp: unknown, options?: ZcodeInteractionPermissionParams["options"]): Extract<ZcodeInteractionResponse, {
     decision: string;
 }>;
 /** ExitPlanMode rendered as approve/reject permission options. */

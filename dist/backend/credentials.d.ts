@@ -7,50 +7,39 @@
  * vars, so we read the config and inject the active provider's settings into
  * the subprocess environment.
  */
-/** The enabled provider selected from config.json. */
-export interface ActiveProvider {
-    id: string;
-    name: string;
-    kind: string;
-    baseURL: string;
-    modelId: string;
-    apiKey: string;
-}
 /** Credentials extracted from the active provider. */
 export interface ZcodeCredentials {
     ZCODE_MODEL?: string;
-    ZCODE_BASE_URL?: string;
     ANTHROPIC_API_KEY?: string;
+    /**
+     * The active provider's model endpoint, for in-process consumers only (the
+     * quota host pick). Deliberately NOT exported into the subprocess
+     * environment: the app-server reads `ZCODE_BASE_URL` FIRST when resolving
+     * its own service origin (configuration, signing and billing endpoints), so
+     * a model URL in that variable would send those requests to the provider
+     * host. Model endpoints reach the app-server through the provider registry
+     * (see `builtinProviderEnv`), never through the environment.
+     */
+    providerBaseURL?: string;
 }
-/**
- * Select the active provider from config.json.
- *
- * `ZCODE_PROVIDER` pins the provider by id; unset keeps the historical
- * "first enabled provider wins" behaviour.
- */
-export declare function loadActiveProvider(): ActiveProvider | undefined;
 /** Read the active provider's credentials from config.json. Best-effort. */
 export declare function loadZcodeCredentials(): ZcodeCredentials;
 /**
  * Merge process.env with config credentials.
  *
- * `ZCODE_BASE_URL` is overloaded by the ZCode CLI: `parseEnvConfig` reads it as
- * the model provider baseURL, while `resolveRuntimeZCodeEndpointOrigin` reads
- * its **origin** as the ZCode endpoint — the host serving
- * `/api/v1/agent/configs`, which carries `codingPlanSignature.enable` and the
- * `proxyEndpoint` routing map. Those are different hosts: the endpoint is
- * `https://zcode.z.ai`, the provider baseURL is e.g.
- * `https://open.bigmodel.cn/api/anthropic`.
+ * Explicit non-empty env vars override config (so `ZCODE_MODEL=foo` works as a
+ * temporary override). Empty-string env vars are treated as unset so they
+ * don't clobber the config value.
  *
- * Passing the provider baseURL through `ZCODE_BASE_URL` collapses the two: the
- * CLI fetches `<provider-host>/api/v1/agent/configs`, gets a 404, and never
- * enables request signing nor learns the endpoint routing map. Requests then go
- * out unsigned, straight to the provider, and the coding-plan discount is lost.
- *
- * Publish the provider into the CLI's own config (`~/.zcode/cli/config.json`)
- * instead, and drop the config-derived `ZCODE_BASE_URL` so the endpoint origin
- * falls back to the production default. An explicit `ZCODE_BASE_URL` in
- * `process.env` is left alone — it is the caller's override.
+ * `ZCODE_BASE_URL` is always removed from the result: the app-server resolves
+ * its service origin as `ZCODE_BASE_URL ?? ZCODE_ENDPOINT_ORIGIN ?? <built-in
+ * production default>`, so a provider model URL in that variable — from this
+ * bridge's historical injection or an inherited shell variable — would send
+ * the app-server's configuration/signing/billing requests to the provider
+ * host, where they fail (`invalid_schema`), client signing falls back to
+ * disabled, and every model request leaves unsigned. With the variable unset,
+ * the app-server uses the same built-in default origin as a desktop-launched
+ * session.
  */
 export declare function mergeEnvWithCreds(creds: ZcodeCredentials): NodeJS.ProcessEnv;
 //# sourceMappingURL=credentials.d.ts.map

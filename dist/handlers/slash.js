@@ -11,11 +11,18 @@
  * `session/send` and the backend resolves them before the model sees them.
  *
  * Commands that require the ZCode TUI (plugins/login/logout/new/resume/
- * locale/expert/workflow/workflows/effort/help) return a friendly error
- * instead of passing raw text to the model (which would confuse it).
+ * locale/expert/effort/help) return a friendly error instead of passing raw
+ * text to the model (which would confuse it).
+ *
+ * `/workflow` and `/workflows` are gated by the dynamic-workflow verdict
+ * (src/config/workflow-gate.ts): disabled/pending → friendly notice; enabled
+ * → the former passes through to the backend's builtin prompt expansion and
+ * the latter renders a local saved-workflows/runs listing.
  *
  * `/mcp` lists all configured MCP servers (from config.json + plugins),
- * showing the user exactly what's available without needing the TUI.
+ * showing the user exactly what's available without needing the TUI. When the
+ * backend answers `mcp/list` (mode:"status"), the card is upgraded to live
+ * per-server health (status / tool count / failureKind).
  *
  * `/quota` is the exception: it does not call ZCode at all — it queries the
  * GLM Coding Plan usage API directly and renders the result.
@@ -33,10 +40,12 @@
 import { randomUUID } from "node:crypto";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { applyModelSwitch } from "../config/runtime-model.js";
-import { emitConfigOptionUpdate } from "../config/options.js";
-import { formatMcpServers, loadMcpServers } from "../config/mcp-discovery.js";
+import { emitConfigOptionUpdate, rememberModelChoice } from "../config/options.js";
+import { formatMcpServerHealth, formatMcpServers, loadMcpServers, } from "../config/mcp-discovery.js";
 import { loadPluginCommands } from "../config/plugin-commands.js";
 import { loadSkillCommands } from "../config/skill-discovery.js";
+import { goalModeIsBackend } from "../config/settings.js";
+import { workflowGateNow } from "../config/workflow-gate.js";
 import { messages } from "../i18n.js";
 import { formatQuota, queryQuota } from "../quota/index.js";
 import { CONFIG_DISPATCH, SLASH_COMMANDS, warn } from "../utils.js";
@@ -56,6 +65,10 @@ function resumeLabel(title, updatedAt) {
  * UI (selection panels, login flows, etc.). They cannot work in app-server
  * mode, so we return a friendly error instead of passing raw `/cmd` text to
  * the model (which would produce confusing output).
+ *
+ * (`workflow`/`workflows` are NOT here anymore: `/workflow` passes through to
+ * the backend's builtin prompt expansion and `/workflows` is a local listing,
+ * both gated by the dynamic-workflow verdict — see the cases below.)
  */
 const UNSUPPORTED_TUI_COMMANDS = new Set([
     "plugins",
@@ -64,8 +77,6 @@ const UNSUPPORTED_TUI_COMMANDS = new Set([
     "new",
     "locale",
     "expert",
-    "workflow",
-    "workflows",
     "effort",
     "help",
 ]);
@@ -105,32 +116,25 @@ function knownCommandSet() {
     }
     return knownCommands;
 }
-/** Whether `cmd` (already lowercased, no leading slash) is a real command. */
-function isKnownCommand(cmd) {
-    // $-prefixed names are discovered Skills (e.g. /$tdd) — always passthrough.
-    return cmd.startsWith("$") || knownCommandSet().has(cmd);
-}
 /**
- * Neutralise slash-command resolution for prompts that are NOT real commands.
+ * Wire text for `/`-leading prompts. Identity on 0.16.9 — see below.
  *
- * The backend parses any prompt whose trimmed text starts with `/` as a
- * command invocation (`name + args`), and an unresolvable name can fail the
- * whole turn. This helper decides the wire text for `/`-leading prompts:
- *   - known command → returned unchanged (the backend resolves it);
- *   - anything else (e.g. a pasted path `/Users/me/proj`) → prefixed with a
- *     zero-width space. U+200B survives the backend's trim(), so the
- * `^\/` command parse can never match, while the model sees the prompt
- *     verbatim (ZWSP is invisible and tokenizes as nothing).
+ * This used to prefix unknown `/x` prompts with a zero-width space, on the
+ * reverse-engineered belief that the backend hard-fails a turn whose prompt
+ * fails command resolution. The open-sourced runtime disproves that: command
+ * parsing recognizes ONLY /compact, /fork, /rewind
+ * (core/src/runtime/methods/turn.ts:105-106,240-267), and every other name
+ * returns undefined from resolveZCodeCustomCommandPrompt — the input facade
+ * then passes the ORIGINAL text to the model as a normal prompt, with no
+ * half-expansion and no turn failure (bootstrap/src/custom-command-prompt.ts:31-44,
+ * comment at :39-41). The ZWSP injection therefore only corrupted session
+ * history and model input.
  *
- * Non-slash prompts pass through unchanged.
+ * Kept as the single seam where a legacy-build guard would live if a build
+ * that DOES hard-fail unknown commands ever needs supporting again.
  */
 export function neutralizeSlashText(text) {
-    const stripped = text.trimStart();
-    if (!stripped.startsWith("/"))
-        return text;
-    const parts = stripped.slice(1).split(/\s(.*)/s);
-    const cmd = (parts[0] ?? "").toLowerCase();
-    return isKnownCommand(cmd) ? text : `\u200B${text}`;
+    return text;
 }
 /**
  * Shared flow behind /auto and /goal: the bridge-driven goal loop
@@ -199,8 +203,140 @@ async function autoFlow(server, acpSid, zcodeSid, arg, label, opts = {}) {
         return opts.onStart(driver);
     return label === "goal" ? messages().slashGoalSet(arg) : messages().slashAutoSet(arg);
 }
-/** Try to intercept a slash command. Returns a PromptResponse when handled, null otherwise. */
-export async function handleSlashCommand(server, cx, acpSid, zcodeSid, text) {
+/**
+ * Fetch per-server MCP health from the backend `mcp/list` RPC with
+ * `mode:"status"` (params `{workspace:{workspacePath, workspaceKey}}` —
+ * workspace-level, no sessionId; result `statuses` keyed by server name).
+ *
+ * Best-effort: returns null on ANY failure (older backend answering -32601,
+ * timeout, malformed result, empty status map) after at most one warn, and
+ * the caller falls back to the local-discovery card unchanged.
+ */
+async function fetchMcpStatuses(server, acpSid) {
+    const cwd = server.sessionCwds.get(acpSid) ?? server.projectCwd();
+    try {
+        const resp = await (await server.ensureBackend()).request(server.nextId(), "mcp/list", { workspace: { workspacePath: cwd, workspaceKey: cwd }, mode: "status" }, 15000);
+        if (resp.error) {
+            warn(`/mcp: mcp/list failed (${resp.error.message}) — using local discovery`);
+            return null;
+        }
+        const raw = resp.result?.statuses;
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+            warn("/mcp: mcp/list returned no statuses — using local discovery");
+            return null;
+        }
+        const out = {};
+        for (const [name, entry] of Object.entries(raw)) {
+            if (!entry || typeof entry !== "object")
+                continue;
+            const o = entry;
+            const health = {
+                status: typeof o["status"] === "string" ? o["status"] : "unknown",
+                toolCount: typeof o["toolCount"] === "number" ? o["toolCount"] : 0,
+            };
+            if (typeof o["failureKind"] === "string")
+                health.failureKind = o["failureKind"];
+            const authUrl = o["authorization"]
+                ?.authorizationUrl;
+            if (typeof authUrl === "string" && authUrl)
+                health.authorizationUrl = authUrl;
+            out[name] = health;
+        }
+        // An empty map carries no health information — keep the local card.
+        return Object.keys(out).length > 0 ? out : null;
+    }
+    catch (e) {
+        warn(`/mcp: mcp/list threw (${e instanceof Error ? e.message : String(e)}) — using local discovery`);
+        return null;
+    }
+}
+/** `/workflows` run-row timestamp: epoch ms → "YYYY-MM-DD HH:mm" (UTC). */
+function runTimestamp(updatedAt) {
+    if (typeof updatedAt !== "number" || !Number.isFinite(updatedAt))
+        return "?";
+    return new Date(updatedAt).toISOString().slice(0, 16).replace("T", " ");
+}
+/** Fold an allSettled outcome into a response shape (rejection → error resp). */
+function outcomeResponse(outcome) {
+    if (outcome.status === "fulfilled")
+        return outcome.value;
+    const reason = outcome.reason;
+    return {
+        id: 0,
+        error: { message: reason instanceof Error ? reason.message : String(reason) },
+    };
+}
+/** Per-RPC bound for the `/workflows` listing (parallel — this is the prompt path). */
+const WORKFLOWS_RPC_TIMEOUT_MS = 8000;
+/**
+ * `/workflows` body: saved workflows (`workflows/list`) plus recent runs
+ * (`workflows/runs`) — the backend's session-less workspace-level RPCs, so
+ * the listing costs zero model turns. The two calls are INDEPENDENT and run
+ * in parallel (Promise.allSettled, 8s each) so a hung backend stalls the
+ * prompt at most one bound, not two serial ones. Both blocks stay
+ * best-effort: a runs failure appends an error note without hiding the
+ * workflow list, and vice versa. Result shapes per upstream zcode-protocol
+ * (index.ts:2723-2905).
+ */
+async function workflowsListText(server, acpSid) {
+    const cwd = server.sessionCwds.get(acpSid) ?? server.projectCwd();
+    const workspace = { workspacePath: cwd, workspaceKey: cwd };
+    const backend = await server.ensureBackend();
+    const blocks = [];
+    const [listOutcome, runsOutcome] = await Promise.allSettled([
+        backend.request(server.nextId(), "workflows/list", { workspace }, WORKFLOWS_RPC_TIMEOUT_MS),
+        backend.request(server.nextId(), "workflows/runs", { workspace, limit: 10 }, WORKFLOWS_RPC_TIMEOUT_MS),
+    ]);
+    const listResp = outcomeResponse(listOutcome);
+    if (listResp.error) {
+        blocks.push(`⚠ workflows/list failed: ${listResp.error.message ?? "error"}`);
+    }
+    else {
+        const result = listResp.result;
+        const entries = (result?.workflows ?? []).filter((w) => typeof w?.name === "string" && w.name.length > 0);
+        const lines = entries.map((w) => {
+            const scope = typeof w.scope === "string" ? ` (${w.scope})` : "";
+            const desc = typeof w.description === "string" && w.description.trim()
+                ? ` — ${w.description.trim()}`
+                : "";
+            return `- ${w.name}${scope}${desc}`;
+        });
+        blocks.push(lines.length > 0
+            ? `Saved workflows (${entries.length}):\n${lines.join("\n")}`
+            : "No saved workflows.");
+        const invalidCount = result?.invalid?.length ?? 0;
+        if (invalidCount > 0)
+            blocks.push(`(invalid: ${invalidCount})`);
+    }
+    const runsResp = outcomeResponse(runsOutcome);
+    if (runsResp.error) {
+        blocks.push(`⚠ workflows/runs failed: ${runsResp.error.message ?? "error"}`);
+    }
+    else {
+        const result = runsResp.result;
+        const rows = (result?.runs ?? []).map((r) => {
+            const name = typeof r.name === "string" && r.name ? r.name : (r.runId ?? "?");
+            const status = typeof r.status === "string" ? r.status : "?";
+            const when = runTimestamp(typeof r.updatedAt === "number" ? r.updatedAt : undefined);
+            // Parent session hint (short suffix only — raw ids stay out of the UI).
+            const parent = typeof r.parentSessionId === "string" && r.parentSessionId
+                ? ` · from …${r.parentSessionId.slice(-8)}`
+                : "";
+            return `- ${name} · ${status} · ${when}${parent}`;
+        });
+        const more = result?.truncated === true ? " …" : "";
+        blocks.push(rows.length > 0 ? `Recent runs:\n${rows.join("\n")}${more}` : "No recent runs.");
+    }
+    return blocks.join("\n\n");
+}
+/**
+ * Try to intercept a slash command. Returns a PromptResponse when handled, null otherwise.
+ *
+ * `client` is the REQUESTING connection (runPrompt's 6th arg, undefined for
+ * client-less invocations). Only replay-shaped dispatch — /resume's history
+ * replay — uses it; command feedback keeps going through the broadcast cx.
+ */
+export async function handleSlashCommand(server, cx, acpSid, zcodeSid, text, client) {
     const stripped = text.trim();
     if (!stripped.startsWith("/"))
         return null;
@@ -225,16 +361,27 @@ export async function handleSlashCommand(server, cx, acpSid, zcodeSid, text) {
                 return ok(formatQuota(result));
             }
             case "mcp": {
-                // Lists all configured MCP servers (from config.json + enabled plugins).
-                // Does not touch ZCode — reads the same config the backend auto-loads.
-                return ok(formatMcpServers(loadMcpServers()));
+                // Lists all configured MCP servers (from config.json + enabled plugins),
+                // enriched with live per-server health from the backend `mcp/list` RPC
+                // (mode:"status" — reports health WITHOUT connecting). Any RPC failure
+                // (older backend, -32601, timeout) keeps the local-discovery card.
+                const servers = loadMcpServers();
+                const statuses = await fetchMcpStatuses(server, acpSid);
+                return ok(statuses ? formatMcpServerHealth(statuses) : formatMcpServers(servers));
             }
             case "compact": {
-                const result = (await compact(server, { sessionId: acpSid }, cx));
+                // `/compact <focus…>` forwards the argument as compact instructions.
+                const result = (await compact(server, { sessionId: acpSid, instructions: arg || undefined }, cx));
                 if (result.__lockTimeout) {
                     // 300s elapsed but the lock never released — the backend may still be
                     // compacting; the next prompt will hit "a prompt is already running".
                     return ok(messages().slashCompactTimeout);
+                }
+                if (result.__compactFailed) {
+                    return ok(messages().slashCompactFailed);
+                }
+                if (result.__alreadyRunning) {
+                    return ok(messages().slashCompactAlreadyRunning);
                 }
                 return ok(messages().slashCompacted);
             }
@@ -245,9 +392,9 @@ export async function handleSlashCommand(server, cx, acpSid, zcodeSid, text) {
                 // ACP clients never saw goal progress — only "goal set" plus untyped
                 // leaked events the client renders as "Other" (issue #178). The loop
                 // is validated against the real backend now, so /goal shares the
-                // /auto machinery. Escape hatch: ZCODE_ACP_GOAL_MODE=backend
-                // restores the legacy backend goal mode.
-                if (process.env.ZCODE_ACP_GOAL_MODE === "backend") {
+                // /auto machinery. Escape hatch: goal.mode "backend" (config file)
+                // or ZCODE_ACP_GOAL_MODE=backend restores the legacy backend goal mode.
+                if (goalModeIsBackend()) {
                     if (!arg)
                         throw new RequestError(-32602, messages().slashErrGoalArg);
                     await goal(server, { sessionId: acpSid, action: "set", objective: arg });
@@ -309,7 +456,11 @@ export async function handleSlashCommand(server, cx, acpSid, zcodeSid, text) {
                         return ok(messages().slashResumeCancelled);
                     chosen = picked;
                 }
-                const result = await resumeIntoSession(server, cx, acpSid, chosen);
+                // Targeted replay: the adopting connection renders the adopted
+                // history, and the broadcast cx would append it to every OTHER
+                // attached client's transcript — the "replay disorder" fixed for
+                // session/load + session/resume (2026-09-21), same rule here.
+                const result = await resumeIntoSession(server, client ?? cx, acpSid, chosen);
                 if (!result.ok)
                     return ok(result.error);
                 return ok(messages().slashResumed(result.title ?? chosen));
@@ -320,6 +471,11 @@ export async function handleSlashCommand(server, cx, acpSid, zcodeSid, text) {
                 const switchOk = await applyModelSwitch(server, zcodeSid, arg);
                 if (!switchOk)
                     throw new RequestError(-32603, messages().slashErrSwitchFailed(arg));
+                // Remember the choice exactly like the dropdown path (setConfigOption):
+                // without it a switch made here is invisible to the post-resume
+                // re-assert, which would roll the session back to an older remembered
+                // model — and the TUI's ONLY switch path would have no stickiness.
+                rememberModelChoice(server, acpSid, zcodeSid, { model: arg });
                 await emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, "model");
                 return ok(messages().slashModelSet(arg));
             }
@@ -330,12 +486,14 @@ export async function handleSlashCommand(server, cx, acpSid, zcodeSid, text) {
                 const dispatch = CONFIG_DISPATCH[cmd];
                 if (!dispatch)
                     throw new RequestError(-32602, messages().slashErrUnknown(cmd));
-                const resp = await server
-                    .ensureBackend()
-                    .request(server.nextId(), dispatch.method, { sessionId: zcodeSid, [dispatch.paramKey]: arg }, 15000);
+                const resp = await (await server.ensureBackend()).request(server.nextId(), dispatch.method, { sessionId: zcodeSid, [dispatch.paramKey]: arg }, 15000);
                 if (resp.error) {
                     throw new RequestError(-32603, messages().slashErrFailed(cmd, resp.error.message));
                 }
+                // Remember a thought-level switch like the dropdown path — /thought
+                // is the TUI's only level switch and must survive resumes.
+                if (cmd === "thought")
+                    rememberModelChoice(server, acpSid, zcodeSid, { thought: arg });
                 // Notify the editor UI: emit config_option_update (+ current_mode_update
                 // for mode). Without this the dropdown / mode indicator never reflects
                 // the change — slash commands return end_turn and bypass the turn-
@@ -344,6 +502,26 @@ export async function handleSlashCommand(server, cx, acpSid, zcodeSid, text) {
                 if (cmd === "mode")
                     server.lastMode.set(acpSid, arg);
                 return ok(`✓ ${cmd} = ${arg}`);
+            }
+            case "workflow": {
+                // Gate first (desktop-host parity, fail-closed): disabled or still
+                // pending → friendly notice instead of passing raw text to the model.
+                if (!workflowGateNow(server)?.enabled) {
+                    return ok(messages().workflowDisabled);
+                }
+                // Enabled → PASSTHROUGH: the backend's builtin prompt resolver
+                // expands /workflow on the session/send path (a pure prompt — the
+                // model decides topology and calls CreateWorkflow). Never pre-expand
+                // bridge-side.
+                return null;
+            }
+            case "workflows": {
+                // Local listing (zero model cost): saved workflows + recent runs
+                // straight from the backend's session-less workflows/* RPCs.
+                if (!workflowGateNow(server)?.enabled) {
+                    return ok(messages().workflowDisabled);
+                }
+                return ok(await workflowsListText(server, acpSid));
             }
             default:
                 // Known passthrough commands (skill/init/plugin commands) → let the
@@ -368,8 +546,8 @@ export async function handleSlashCommand(server, cx, acpSid, zcodeSid, text) {
                     return null;
                 // Unknown /x (not advertised, not a built-in — e.g. a pasted directory
                 // path): NOT a command. Return null for the normal turn loop; the
-                // caller runs the prompt through neutralizeSlashText() so the backend
-                // never attempts command resolution on it.
+                // backend itself passes unresolvable /x through as a normal prompt
+                // (custom-command-prompt.ts:31-44), so no text rewriting is needed.
                 return null;
         }
     }

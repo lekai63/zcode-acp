@@ -14,12 +14,28 @@
  *
  * Per-process plumbing (ZCODE_ACP_REMOTE_ORIGIN, _PIN_CWD,
  * ZCODE_ACP_RESUME_SESSION) is deliberately NOT file-configurable — those
- * carry per-request/per-role state, not user preference.
+ * carry per-request/per-role state, not user preference. Bootstrap-time
+ * variables (ZCODE_BIN, ZCODE_NODE, ZCODE_HOME, ZCODE_PROVIDER, …) are
+ * resolved once at startup and stay env-only for the same reason.
  */
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { warn } from "../utils.js";
+// Local copy of utils.warn: importing it here would close a cycle once
+// utils.isDebug reads the merged debug flag (utils → settings → user-config
+// → utils). ESLint has no no-cycle rule — the graph stays acyclic by hand.
+//
+// Warn-once dedup, keyed by message: the loader sits on hot paths (log(),
+// messages()), so an invalid field must not re-warn on every read. A NEW
+// mistake (different message) still warns; the paths embedded in the
+// messages keep per-file tests independent.
+const warnedOnce = new Set();
+function warn(msg) {
+    if (warnedOnce.has(msg))
+        return;
+    warnedOnce.add(msg);
+    process.stderr.write(`[zcode-acp] ${msg}\n`);
+}
 /** Resolve the config file path: $XDG_CONFIG_HOME/zcode-acp or ~/.config/zcode-acp. */
 export function userConfigPath(env = process.env) {
     const base = (env.XDG_CONFIG_HOME ?? "").trim() || path.join(homedir(), ".config");
@@ -27,6 +43,29 @@ export function userConfigPath(env = process.env) {
 }
 function isPlainObject(v) {
     return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+/** The session modes the backend's own mode select offers (mirrors CONFIG_META). */
+const SESSION_MODES = new Set(["plan", "build", "edit", "yolo", "auto"]);
+/** Normalized language pick: "zh*"/"en*" prefixes accepted, else undefined. */
+function parseLang(v) {
+    if (typeof v !== "string")
+        return undefined;
+    const s = v.trim().toLowerCase();
+    if (s.startsWith("zh"))
+        return "zh";
+    if (s.startsWith("en"))
+        return "en";
+    return undefined;
+}
+/** Integer within [min, ∞) — JSON floats and junk read as absent (warned). */
+function parseIntField(v, min, label, file) {
+    if (v === undefined)
+        return undefined;
+    if (typeof v !== "number" || !Number.isInteger(v) || v < min) {
+        warn(`config: ${label}=${JSON.stringify(v)} in ${file} is not an integer >= ${min} — ignoring`);
+        return undefined;
+    }
+    return v;
 }
 /**
  * Read and validate the user config. Best-effort: a missing file is the
@@ -54,12 +93,12 @@ export function loadUserConfig(env = process.env) {
         warn(`config: ${file} is not a JSON object — ignoring`);
         return {};
     }
-    const remote = parsed["remote"];
-    if (remote === undefined && parsed["quota"] === undefined)
-        return {};
     const result = {};
+    const remote = parsed["remote"];
     if (remote !== undefined && isPlainObject(remote)) {
-        result.remote = parseRemoteSection(remote, file);
+        const parsedRemote = parseRemoteSection(remote, file);
+        if (Object.keys(parsedRemote).length > 0)
+            result.remote = parsedRemote;
     }
     else if (remote !== undefined) {
         warn(`config: "remote" in ${file} is not an object — ignoring the section`);
@@ -75,6 +114,7 @@ export function loadUserConfig(env = process.env) {
                 ["ollamaApiKey", "ollamaApiKey"],
                 ["opencodeGoWorkspaceId", "opencodeGoWorkspaceId"],
                 ["opencodeGoAuthCookie", "opencodeGoAuthCookie"],
+                ["opencodeGoSessionToken", "opencodeGoSessionToken"],
             ]) {
                 const v = quota[jsonKey];
                 if (typeof v === "string" && v.trim())
@@ -84,7 +124,96 @@ export function loadUserConfig(env = process.env) {
                 result.quota = q;
         }
     }
+    const lang = parseLang(parsed["lang"]);
+    if (parsed["lang"] !== undefined) {
+        if (lang)
+            result.lang = lang;
+        else
+            warn(`config: "lang"=${JSON.stringify(parsed["lang"])} in ${file} is not "zh"/"en" — ignoring`);
+    }
+    const debug = parsed["debug"];
+    if (debug !== undefined) {
+        if (typeof debug === "boolean")
+            result.debug = debug;
+        else
+            warn(`config: "debug"=${JSON.stringify(debug)} in ${file} is not a boolean — ignoring`);
+    }
+    result.session = parseSection(parsed, "session", file, (body, label) => {
+        const s = {};
+        const mode = body["mode"];
+        if (mode !== undefined) {
+            const m = typeof mode === "string" ? mode.trim() : "";
+            if (m && SESSION_MODES.has(m))
+                s.mode = m;
+            else
+                warn(`config: ${label}.mode=${JSON.stringify(mode)} is not a session mode — ignoring`);
+        }
+        return s;
+    });
+    result.autoCompact = parseSection(parsed, "autoCompact", file, (body, label) => {
+        const threshold = parseIntField(body["threshold"], 1, `${label}.threshold`, file);
+        return threshold !== undefined ? { threshold } : {};
+    });
+    result.goal = parseSection(parsed, "goal", file, (body, label) => {
+        const g = {};
+        const maxTurns = parseIntField(body["maxTurns"], 1, `${label}.maxTurns`, file);
+        if (maxTurns !== undefined)
+            g.maxTurns = maxTurns;
+        const mode = body["mode"];
+        if (mode !== undefined) {
+            if (mode === "backend")
+                g.mode = "backend";
+            else
+                warn(`config: ${label}.mode=${JSON.stringify(mode)} in ${file} is not "backend" — ignoring`);
+        }
+        return g;
+    });
+    result.interaction = parseSection(parsed, "interaction", file, (body, label) => {
+        const timeoutMs = parseIntField(body["timeoutMs"], 0, `${label}.timeoutMs`, file);
+        return timeoutMs !== undefined ? { timeoutMs } : {};
+    });
+    result.sandbox = parseSection(parsed, "sandbox", file, (body, label) => {
+        const enabled = body["enabled"];
+        if (enabled === undefined)
+            return {};
+        if (typeof enabled === "boolean")
+            return { enabled };
+        warn(`config: ${label}.enabled=${JSON.stringify(enabled)} in ${file} is not a boolean — ignoring`);
+        return {};
+    });
+    // An empty string is a VALID value here (martty reads it as "hide every
+    // dock segment") — only non-strings are rejected.
+    result.tui = parseSection(parsed, "tui", file, (body, label) => {
+        const stats = body["stats"];
+        if (stats === undefined)
+            return {};
+        if (typeof stats === "string")
+            return { stats };
+        warn(`config: ${label}.stats=${JSON.stringify(stats)} in ${file} is not a string — ignoring`);
+        return {};
+    });
+    // Drop the empty section shells so consumers' `??` fallbacks stay honest.
+    for (const key of Object.keys(result)) {
+        if (isPlainObject(result[key]) && Object.keys(result[key]).length === 0) {
+            delete result[key];
+        }
+    }
     return result;
+}
+/**
+ * Parse one object-valued section: absent → undefined, non-object → warn +
+ * undefined, valid shape → the parsed (possibly empty) object. Field-level
+ * validation lives in the per-section callback.
+ */
+function parseSection(root, name, file, parse) {
+    const body = root[name];
+    if (body === undefined)
+        return undefined;
+    if (!isPlainObject(body)) {
+        warn(`config: "${name}" in ${file} is not an object — ignoring the section`);
+        return undefined;
+    }
+    return parse(body, name);
 }
 /** Parse the validated `remote` section object into {@link RemoteUserConfig}. */
 function parseRemoteSection(remote, file) {

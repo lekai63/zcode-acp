@@ -5,6 +5,7 @@
  * so either can feed `dispatchEvent`. State held per-translator:
  *   - seenToolIds / toolNames / toolInputs / finalToolIds for tool lifecycle
  *   - turnStarted / turnDone / turnFailed / turnResultType / turnError for turn state
+ *     (plus turnUsage / turnCacheStats captured from the same terminal event)
  *
  * A critical quirk: zcode streams tool input via `model.streaming tool_call`
  * BEFORE the `tool.updated scheduled` event, whose `input` is then omitted
@@ -42,6 +43,31 @@ export class EventTranslator {
      */
     turnUsage = null;
     /**
+     * cacheStats from this turn's `turn.completed` payload (prompt-cache hit
+     * counts; `cacheReadTokens` optional). Null when the backend sent none —
+     * pre-cacheStats builds omit the field. Consumed by the dispatcher to render
+     * the turn-end status line alongside the TurnInfo event.
+     */
+    turnCacheStats = null;
+    /**
+     * The protocol layer's authoritative terminal broadcast for a session/send
+     * turn: `state.updated {reason:"prompt_completed"}` from
+     * runPromptTurnInBackground's finally (server-operations.ts:2469), and
+     * `"prompt_failed"` when the turn threw (:2445). Unlike `turn.completed` it
+     * is emitted by the protocol layer, so it survives a deaf event stream — the
+     * turn loop consults these flags in its stall branch to end a
+     * lost-terminal turn in seconds instead of waiting out STALE_FREEZE_MS
+     * (10 min).
+     *
+     * Deliberately NOT a primary terminal: the notification carries no turnId,
+     * and a prompt accepted during the previous turn's post-clear snapshot build
+     * (`afterStateMutation` awaits real I/O before emitting) could deliver a
+     * stale one to the next turn's translator. Only set after OUR
+     * `turn.started`, and only acted on after 15s of stream silence.
+     */
+    sawPromptCompleted = false;
+    sawPromptFailed = false;
+    /**
      * True while inside a background-task notification turn
      * (`turn.started {inputSource:"background_task"}`). Set on its turn.started,
      * cleared on the next user-initiated turn.started. While true, `translate`
@@ -56,6 +82,10 @@ export class EventTranslator {
      * the user's turn while the backend kept generating (the "ghost completed"
      * remote-status bug). turnId-less backends keep the old behavior (both ids
      * must be present for a mismatch to drop an event).
+     *
+     * Read from the event ENVELOPE (`event.turnId`) — 0.16.9's turn.* payloads
+     * are strict and carry no turnId; a payload-only read silently nulled this
+     * and the whole attribution below was dead code (fixed 2026-09-21).
      */
     activeTurnId = null;
     skippingForeignTurn = false;
@@ -116,7 +146,9 @@ export class EventTranslator {
                 return results;
             }
             this.skippingBackgroundTurn = false;
-            const turnId = payload["turnId"] ?? null;
+            // Envelope-first (0.16.9 shape); a payload-carried turnId stays valid
+            // for builds that spelled it that way.
+            const turnId = event.turnId ?? payload["turnId"] ?? null;
             if (!this.turnStarted) {
                 this.activeTurnId = turnId;
                 this.skippingForeignTurn = false;
@@ -139,7 +171,7 @@ export class EventTranslator {
             return results;
         }
         else if (etype === "turn.completed" || etype === "turn.failed") {
-            const evTurnId = payload["turnId"] ?? null;
+            const evTurnId = event.turnId ?? payload["turnId"] ?? null;
             if (this.skippingForeignTurn) {
                 // A turn ended while a foreign (internal) turn was in flight. When it
                 // provably belongs to the foreign turn, drop it and resume normal
@@ -160,7 +192,8 @@ export class EventTranslator {
                 this.turnDone = true;
                 this.turnResultType = payload["resultType"] ?? "success";
                 this.turnUsage = payload["usage"] ?? null;
-                results.push(...this.translateTurnDone(payload));
+                this.turnCacheStats = parseCacheStats(payload["cacheStats"]);
+                results.push(...this.translateTurnDone());
                 log(`  [event] turn.completed (resultType=${this.turnResultType})`);
             }
             else {
@@ -194,6 +227,18 @@ export class EventTranslator {
             // mid-turn). The backend notification carries the authoritative full
             // settings patch — forward the new values so the editor UI follows the
             // switch immediately instead of at the next turn's completion.
+            const reason = payload["reason"];
+            if ((reason === "prompt_completed" || reason === "prompt_failed") &&
+                this.turnStarted &&
+                !this.turnDone) {
+                // Authoritative terminal broadcast for OUR turn (see the field
+                // docstrings for why this is not a primary terminal).
+                if (reason === "prompt_failed")
+                    this.sawPromptFailed = true;
+                else
+                    this.sawPromptCompleted = true;
+                log(`  [event] state.updated (${reason}) → terminal broadcast recorded`);
+            }
             results.push(...this.translateStateUpdated(payload));
         }
         return results;
@@ -408,14 +453,42 @@ export class EventTranslator {
             newEv.locations = locations;
         return newEv;
     }
-    translateTurnDone(payload) {
-        const usage = payload["usage"] ?? {};
-        // Use || (not ??) to match Python's `or` semantics: a falsy totalTokens
-        // (0 / undefined) falls back to tokenCount, then to 0. With ?? a 0 would
-        // be kept as-is and never fall back, diverging from the Python reference.
-        const used = usage["totalTokens"] || payload["tokenCount"] || 0;
-        const size = usage["contextWindow"] || 0;
-        return [{ kind: "UsageDelta", used, size }];
+    translateTurnDone() {
+        // Terminal info line ONLY — no UsageDelta. turn.completed's usage block
+        // is the turn's CUMULATIVE consumption (billing-grade, summed across
+        // every model request of the turn); reporting it as the context meter
+        // made a multi-request turn read >100% of the window (#228). The
+        // authoritative occupancy (projection.contextUsed) reaches clients via
+        // the turn-completion reconciliation diff and the mid-turn watermark
+        // forwarder, both of which read session/read's projection; the per-turn
+        // consumption itself still surfaces through PromptResponse.usage
+        // (turnResult ← this.turnUsage) — a different, per-turn field.
+        const info = { kind: "TurnInfo", resultType: this.turnResultType ?? "success" };
+        if (this.turnCacheStats)
+            info.cacheStats = this.turnCacheStats;
+        return [info];
     }
+}
+/**
+ * Parse `turn.completed` cacheStats. Returns undefined on absent/malformed
+ * input — an unreadable stats block must never break the turn-end flow.
+ */
+function parseCacheStats(raw) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+        return null;
+    const o = raw;
+    const totalMessages = o["totalMessages"];
+    const cachedMessages = o["cachedMessages"];
+    if (typeof totalMessages !== "number" || typeof cachedMessages !== "number")
+        return null;
+    const stats = {
+        totalMessages,
+        cachedMessages,
+        lastCacheHit: o["lastCacheHit"] === true,
+    };
+    const read = o["cacheReadTokens"];
+    if (typeof read === "number")
+        stats.cacheReadTokens = read;
+    return stats;
 }
 //# sourceMappingURL=event-translator.js.map

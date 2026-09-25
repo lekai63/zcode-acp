@@ -50,9 +50,13 @@ export declare class EventStreamListener {
     pollEvent(timeoutMs?: number): Promise<ZcodeEvent | null>;
     /**
      * Stall recovery: resubscribe from `lastSeq` so the server replays missed
-     * events. Failure is logged but non-fatal — the caller degrades to polling.
-     * The snapshot (if returned despite `includeSnapshot:false`) is intentionally
-     * not consumed; resubscribe only refreshes the watermark + resumes the push.
+     * events — the missed window arrives IN the response (`events`, source:
+     * subscribeSession returns every event with seq > afterSeq) and is queued
+     * into the stream in seq order, so the turn loop sees the gap instead of a
+     * silently advanced watermark (the attribution gate still decides which
+     * events belong to the current turn). Failure is logged but non-fatal —
+     * the caller degrades to polling. The snapshot (if returned despite
+     * `includeSnapshot:false`) is intentionally not consumed.
      */
     resubscribe(nextId: NextId): Promise<boolean>;
 }

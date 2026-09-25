@@ -2,8 +2,9 @@
  * Bridge-emitted user-facing strings (editor popups, status/hint lines).
  *
  * Language selection, first match wins:
- *   1. ZCODE_ACP_LANG  — explicit override ("zh", "en"; prefixes like "zh_CN"
- *      accepted, case-insensitive)
+ *   1. Explicit override — `lang` in ~/.config/zcode-acp/config.json, else
+ *      ZCODE_ACP_LANG ("zh", "en"; prefixes like "zh_CN" accepted,
+ *      case-insensitive)
  *   2. The ZCode desktop app's language choice — `localePreference` (explicit
  *      user pick), falling back to `locale` (effective), in
  *      <zcode-home>/v2/setting.json (the ZCode data root — `~/.zcode`, or
@@ -55,6 +56,10 @@ export interface Messages {
     goalBackendRecovered: string;
     /** Prompt queued behind a still-generating turn (drain gate). */
     promptQueuedBehindTurn: string;
+    /** Live sub-agent roster line during silent phases (session/subagents). */
+    subagentStatusLine: (running: number, waiting: number, blocked: number) => string;
+    /** One-shot terminal summary for sub-agents that ended during the turn. */
+    subagentEndedLine: (ended: number, failed: number, cancelled: number) => string;
     thinkingPlaceholder: string;
     /** Steered prompt silently swallowed by the still-running turn. */
     messageSwallowedByTurn: string;
@@ -77,6 +82,8 @@ export interface Messages {
     /** Ack for the boot-resume banner handshake (auto-submitted trigger). */
     bootResumeAck: string;
     slashCompactTimeout: string;
+    slashCompactFailed: string;
+    slashCompactAlreadyRunning: string;
     slashGoalSet: (value: string) => string;
     slashAutoSet: (value: string) => string;
     slashErrAutoArg: string;
@@ -125,14 +132,37 @@ export interface Messages {
     mcpFromConfig: string;
     mcpFromPlugins: string;
     mcpFooter: string;
+    /** `/mcp` live health panel (backend mcp/list mode:"status"). */
+    mcpHealthHeader: (count: number) => string;
+    mcpHealthTools: (count: number) => string;
+    /** Turn-end status line (`turn.completed` resultType + cacheStats). */
+    turnCompleted: string;
+    turnCompletedCache: (cached: number, total: number, cacheRead?: string) => string;
+    turnStoppedEarly: (resultType: string) => string;
     /** Editor slash-command menu: localized descriptions for the static
      *  commands (names and argument hints stay as-is — they are tokens). */
     slashCommandDescriptions: Record<string, string>;
+    /** /workflow · /workflows with the dynamic-workflow gate disabled/pending. */
+    workflowDisabled: string;
     /** Auto-compaction status lines. */
     autoCompactStart: (used: string, threshold: string) => string;
     autoCompactTimeout: string;
     autoCompactDone: string;
     autoCompactFailed: (err: string) => string;
+    /** Fixed reason text for a backend-reported compaction failure (state.updated
+     *  session_compact_failed/cancelled) — fed into autoCompactFailed. */
+    autoCompactBackendFailed: string;
+    /** Prompt rejection notice: a detached auto-compact is running, the message
+     *  was NOT sent — resend after the ✓ compressed line. Now only the bounded
+     *  fallback (a compaction that outlived its settle cap) answers this. */
+    autoCompactBusy: string;
+    /** Prompt hold notice: a detached auto-compact is running, the message is
+     *  QUEUED and goes out by itself once the compaction settles — the session
+     *  stays "executing" and the user has nothing to resend. */
+    autoCompactHeld: string;
+    /** Goal-loop wait note: a compaction holds the lock, the round resumes by
+     * itself once it settles (no user action needed). */
+    autoCompactGoalWait: string;
     /** Pre-popup tool_call titles for interactive requests. */
     popupTitleExitPlan: string;
     popupTitleToolPermission: (tool: string) => string;

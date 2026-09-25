@@ -39,6 +39,7 @@ export declare const PERSONAL_PROVIDER_ENV = "ZCODE_PERSONAL_PROVIDER_CONFIG_FIL
  * ambient value is the best hint.
  */
 export declare function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv;
+export declare function zcodeDataBaseDirEnv(): NodeJS.ProcessEnv;
 /**
  * The backend subcommand and its flags, shared by every launch path.
  *

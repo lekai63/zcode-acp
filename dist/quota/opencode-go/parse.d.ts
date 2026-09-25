@@ -1,41 +1,30 @@
 /**
- * Opencode Go dashboard HTML parser.
+ * Opencode Go status JSON parser.
  *
- * The dashboard is a SolidJS SSR page. Usage data is embedded as hydration
- * assignments inside a `<script>`, in the shape:
+ * The console API (`/console/api/go/status`) returns meter pairs in
+ * micro-cents per window; we compute the percent (used/limit) and the reset
+ * countdown (resetsAt − now) here — the API gives absolute timestamps, the
+ * formatter wants a relative countdown captured at fetch time.
  *
- *   rollingUsage:$R[N]={usagePercent:<n>,resetInSec:<n>}
- *
- * (field order may vary; `$R[N]` is a Solid hydration reference). This is JS
- * source, not JSON, so we extract with regexes rather than `JSON.parse`. Two
- * independent reference implementations (pi-go-bars, @beyona/pi-zai-usage)
- * use the same approach as of 2026-08, but the format has no stability
- * contract — a frontend change will silently break extraction, which is why
- * {@link looksLikeDashboard} guards against parser rot.
+ * Window mapping:
+ *   rolling ← meters.fiveHour (resetsAt is null while the window is idle → 0)
+ *   weekly  ← meters.week
+ *   monthly ← meters.month (carries no resetsAt — anchored to access.endsAt,
+ *             the subscription renewal instant)
  */
 import type { GoWindow } from "./types.js";
-/**
- * Detect whether the HTML is a dashboard page (vs. a login redirect or error
- * page). Used to distinguish "parser is outdated" from "no windows present".
- */
-export declare function looksLikeDashboard(html: string): boolean;
-/** Result of parsing the dashboard — each window is independently optional. */
-export interface ParsedGoDashboard {
+/** Result of parsing the status payload — each window is independently optional. */
+export interface ParsedGoStatus {
     rolling: GoWindow | null;
     weekly: GoWindow | null;
     monthly: GoWindow | null;
     /**
-     * Set when the HTML looks like a dashboard but no windows parsed — the SSR
-     * format likely changed. The caller surfaces this as `unavailable`.
+     * True when the body parsed and carries the status shape but no window
+     * matched — the API layout changed (parser rot).
      */
     parserOutdated: boolean;
 }
-/**
- * Parse the dashboard HTML into the three windows.
- *
- * `parserOutdated` is true when the page looks like a dashboard (contains the
- * window variable names) but none of the three windows matched — signalling
- * that the SolidJS hydration format has drifted.
- */
-export declare function parseGoDashboard(html: string): ParsedGoDashboard;
+/** Detect the status payload shape (`access.meters`) — the parser-rot guard. */
+export declare function looksLikeGoStatus(parsed: unknown): boolean;
+export declare function parseGoStatus(text: string, now?: number): ParsedGoStatus;
 //# sourceMappingURL=parse.d.ts.map

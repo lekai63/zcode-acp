@@ -22,12 +22,23 @@ import { WebSocketServer } from "ws";
 import { runtimeSpawnParts } from "../runtime.js";
 import { AGENT_INFO, log, warn } from "../utils.js";
 import { createFileHandler } from "./file-endpoint.js";
+import { envWithLoginShell } from "./login-shell-env.js";
 import { createSessionCloseHandler } from "./session-close-endpoint.js";
 import { createSessionListHandler } from "./session-list-endpoint.js";
 import { createSessionRenameHandler } from "./session-rename-endpoint.js";
+import { createSettingsHandler } from "./settings-endpoint.js";
 import { createStatusHandler, runningZcodeSids } from "./status-endpoint.js";
 /** How often the bridge re-registers with the hub (also the heartbeat). */
 const HEARTBEAT_MS = 10_000;
+/**
+ * This process's boot instant, in epoch ms.
+ *
+ * Captured once at module load and read through `uptime()` rather than sampled
+ * with `Date.now()` at first register: `Date.now()` there measures when the
+ * register ARRIVED, not when the bridge started, and the gap is exactly what
+ * makes two bridges' start order ambiguous (see the register payload).
+ */
+const processStartTime = Date.now() - process.uptime() * 1000;
 /** Minimum spacing between hub spawn attempts (avoids spawn storms). */
 const SPAWN_THROTTLE_MS = 60_000;
 /** Cap for the 401-spawn backoff ladder (starts at SPAWN_THROTTLE_MS, doubles). */
@@ -182,6 +193,7 @@ export async function startRemoteEndpoint(server, app, config) {
     const upgradeHandler = createNodeWebSocketUpgradeHandler(acpServer, wss);
     const fileHandler = createFileHandler(server);
     const statusHandler = createStatusHandler(server);
+    const settingsHandler = createSettingsHandler(server);
     const sessionCloseHandler = createSessionCloseHandler(server);
     const sessionRenameHandler = createSessionRenameHandler(server);
     const sessionListHandler = createSessionListHandler(server);
@@ -189,8 +201,12 @@ export async function startRemoteEndpoint(server, app, config) {
         const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
         const closeMatch = path.match(/^\/sessions\/([^/]+)\/close$/);
         const renameMatch = path.match(/^\/sessions\/([^/]+)\/rename$/);
+        // Settings lives under a prefix so the routes above stay unambiguous, and
+        // so the hub can strip the same prefix when it re-serves them (ADR-0025).
         if (path === "/acp")
             acpHttpHandler(req, res);
+        else if (path.startsWith("/settings"))
+            settingsHandler(req, res);
         else if (path.startsWith("/fs/"))
             fileHandler(req, res);
         else if (path === "/status")
@@ -245,16 +261,34 @@ export async function startRemoteEndpoint(server, app, config) {
     // Last non-2xx/non-401 register status we warned about (once per stretch).
     let unexpectedStatus = null;
     let spawnThrottledUntil = 0;
+    // The incubated TUI tree this bridge belongs to (ZCODE_ACP_TUI_CLI_PID —
+    // the .command script's $$, exec'd into the CLI): lets the hub's instance
+    // shutdown tear the whole window down, not just this leaf bridge. Serve
+    // origin only — an editor bridge inheriting the var from a TUI-launched
+    // shell must never name another tree.
+    const tuiPidRaw = Number.parseInt((process.env.ZCODE_ACP_TUI_CLI_PID ?? "").trim(), 10);
+    const tuiPid = config.origin === "serve" && Number.isInteger(tuiPidRaw) && tuiPidRaw > 1
+        ? tuiPidRaw
+        : undefined;
     const payload = (sessions) => ({
         token: config.token,
         id: instanceId,
         port,
         pid: process.pid,
+        // This process's own boot instant, for the hub's session-dedupe tie-break.
+        // The hub would otherwise stamp its `Date.now()` at first register, which
+        // is skewed by however long that first register took to arrive — a bridge
+        // whose cold start is slow (provider sync) would rank as NEWER than a
+        // bridge that really started after it, and win a session the other is
+        // driving. A heartbeat re-registration carries the same value, so the
+        // ranking is stable across the bridge's whole life.
+        startedAt: processStartTime,
         workspace: server.workspaceLabel(),
         sessions,
         // "editor" (stdio bridge) or "serve" (headless, hub-spawned, ADR-0014):
         // lets the hub dedupe headless instances per workspace and label them.
         origin: config.origin,
+        ...(tuiPid !== undefined ? { tuiPid } : {}),
         // Hub-incubation correlation (ADR-0016/0017): the hub generates a nonce
         // per spawn and matches its registration poll against it — several
         // incubations can race for one workspace, and without this one's poll
@@ -264,17 +298,24 @@ export async function startRemoteEndpoint(server, app, config) {
         // itself (we then re-spawn it from this dist — see registerOnce).
         version: AGENT_INFO.version,
     });
-    const spawnHub = () => {
+    const spawnHub = async () => {
         try {
             // dist/remote/endpoint.js → dist/bin/hub.js (one level up, then bin/).
             const hubJs = fileURLToPath(new URL("../bin/hub.js", import.meta.url));
+            // The hub is detached and long-lived; it spawns the terminal windows,
+            // serve bridges and (through them) the backends. If IT starts with a
+            // bare launchd PATH, every one of those inherits it and a remotely
+            // opened session cannot find the user's toolchain — so complete the
+            // environment here, once, at the root of the tree. Awaited (async probe)
+            // so this bridge's own event loop never freezes for the probe's timeout.
+            const shellEnv = await envWithLoginShell();
             const child = spawn(...runtimeSpawnParts(hubJs), {
                 detached: true,
                 // Surface the daemon's stderr through the bridge's diagnostics — a
                 // detached "ignore" pipe silently eats startup failures.
                 stdio: ["ignore", "ignore", "pipe"],
                 env: {
-                    ...process.env,
+                    ...shellEnv,
                     ZCODE_ACP_HUB_PORT: String(config.hubPort),
                     ZCODE_ACP_HUB_HOST: config.hubHost,
                     ZCODE_ACP_REMOTE_TOKEN: config.token,
@@ -337,7 +378,7 @@ export async function startRemoteEndpoint(server, app, config) {
                 if (Date.now() >= nextAuthSpawnAt) {
                     nextAuthSpawnAt = Date.now() + authSpawnBackoffMs;
                     authSpawnBackoffMs = Math.min(authSpawnBackoffMs * 2, AUTH_SPAWN_MAX_BACKOFF_MS);
-                    spawnHub();
+                    void spawnHub();
                     const retry = setTimeout(() => void registerOnce(), 1500);
                     retry.unref();
                 }
@@ -377,7 +418,7 @@ export async function startRemoteEndpoint(server, app, config) {
                         if (Date.now() < spawnThrottledUntil)
                             return;
                         spawnThrottledUntil = Date.now() + SPAWN_THROTTLE_MS;
-                        spawnHub();
+                        void spawnHub();
                         const retry = setTimeout(() => void registerOnce(), 1500);
                         retry.unref();
                     }, 2000);
@@ -391,7 +432,7 @@ export async function startRemoteEndpoint(server, app, config) {
             // instead of waiting a full heartbeat cycle.
             if (Date.now() >= spawnThrottledUntil) {
                 spawnThrottledUntil = Date.now() + SPAWN_THROTTLE_MS;
-                spawnHub();
+                void spawnHub();
                 const retry = setTimeout(() => void registerOnce(), 1500);
                 retry.unref();
             }

@@ -23,6 +23,18 @@ export declare class ProjectionDiffer {
     private readonly seenMessageIds;
     private lastPlanSig;
     private readonly seenPatchHashes;
+    /**
+     * Id of the newest message this differ has baselined. Turn-internal reads
+     * scope themselves with `session/messages`' native `afterMessageId` cursor
+     * instead of re-transferring the whole store — everything before the anchor
+     * is either already seen or frozen history the differ never re-emits.
+     *
+     * markSeen takes the last id of the list it is given, so callers pass
+     * either the full history (turn entry) or a post-anchor window (every
+     * re-baseline) — both end at the newest stored message. A read that failed
+     * and degraded to [] leaves the anchor untouched.
+     */
+    historyAnchor: string | null;
     /** Whether any TextDelta fired this turn (used by fallback detection). */
     emittedTextThisTurn: boolean;
     /** Mark all given messages as seen (baseline so we don't re-emit history). */

@@ -18,7 +18,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 import type { ZcodeAcpServer } from "../server.js";
 /** ENV: ZCODE_ACP_GOAL_MAX_TURNS — hard round budget before a pause. */
 export declare function goalMaxTurns(): number;
-/** Goal-loop compaction threshold: the shared env var, else 80% of window. */
+/** Goal-loop compaction threshold: the shared threshold, else 80% of window. */
 export declare function goalCompactThreshold(contextWindow: number): number;
 export declare class GoalLoopDriver {
     readonly zcodeSid: string;
@@ -110,11 +110,22 @@ export declare class GoalLoopDriver {
      * settles the backend before the decompose send.
      */
     private waitForEditorTurnsIdle;
-    /** Text of the last assistant reply at or after `since` (verdict parsing input). */
+    /**
+     * Id of the newest stored message (null when the store is empty) — the
+     * cursor the round's other reads scope themselves with. `limit: 1` makes
+     * this a tail read: the full-history transfer it replaces existed only to
+     * produce a count.
+     */
+    private lastMessageId;
+    /**
+     * Text of the last assistant reply appended after `afterId` (the whole
+     * history when null — verdict and ticket parsing read the session's final
+     * reply). A turn's reply is its newest message, so the cursor-less case
+     * caps the read at a tail window instead of transferring everything.
+     */
     private lastAssistantText;
-    /** Tool-part count in the messages appended since `before` (stall signal). */
+    /** Tool-part count among the messages appended after `afterId` (stall signal). */
     private toolActivitySince;
-    private messageCount;
     private contextUsed;
     private announce;
     private persist;

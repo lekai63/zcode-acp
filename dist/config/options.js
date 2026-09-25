@@ -10,12 +10,78 @@
  * reflects the new state.
  */
 import { readFileSync } from "node:fs";
-import { clientConnectionRoot, CONFIG_DISPATCH, CONFIG_META, log, warn, ZCODE_CREDS_PATH, } from "../utils.js";
+import { recordModelChoice } from "../lazy-sessions.js";
+import { clientConnectionRoot, CONFIG_DISPATCH, CONFIG_META, log, warn, ZCODE_CREDS_PATH, zcodePersonalProviderPath, } from "../utils.js";
 import { configProviderIdFor } from "./account-provider.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 /** Read the config.json contents (UTF-8). Throws on read/parse failure. */
 function readConfig() {
     return JSON.parse(readFileSync(ZCODE_CREDS_PATH, "utf8"));
+}
+function readPersonalProviderConfig() {
+    try {
+        return JSON.parse(readFileSync(zcodePersonalProviderPath(), "utf8"));
+    }
+    catch {
+        return null; // absent/unreadable (or pre-3.12 desktop) — config.json alone decides
+    }
+}
+function loadPersonalModels() {
+    const pc = readPersonalProviderConfig();
+    const providerRules = pc?.config?.providerConfigRules?.providerRules ?? [];
+    const modelRules = [
+        ...(pc?.config?.modelConfigRules?.providerModelRules ?? []),
+        ...(pc?.config?.modelConfigRules?.manualProviderModelRules ?? []),
+    ];
+    if (providerRules.length === 0 && modelRules.length === 0)
+        return null;
+    const out = {
+        modelsByProvider: new Map(),
+        contextByModel: new Map(),
+        reasoningByModel: new Map(),
+        providers: [],
+    };
+    for (const rule of modelRules) {
+        if (!rule.providerId || !rule.modelId)
+            continue;
+        if (rule.config?.enabled === false)
+            continue;
+        const pid = configProviderIdFor(rule.providerId);
+        const ids = out.modelsByProvider.get(pid) ?? [];
+        if (!ids.includes(rule.modelId))
+            ids.push(rule.modelId);
+        out.modelsByProvider.set(pid, ids);
+        const key = `${pid}\\${rule.modelId}`;
+        const ctx = rule.config?.properties?.contextWindow;
+        if (ctx && ctx > 0)
+            out.contextByModel.set(key, ctx);
+        const values = rule.config?.optionSpecs?.reasoningLevel?.values;
+        if (values?.length)
+            out.reasoningByModel.set(key, values);
+    }
+    for (const rule of providerRules) {
+        if (!rule.providerId)
+            continue;
+        out.providers.push({ pid: configProviderIdFor(rule.providerId), rule });
+    }
+    return out;
+}
+/**
+ * A model's declaration from provider_config.json only — the lookup for
+ * models that exist in the desktop's personal config but not (yet) in legacy
+ * config.json. Null when the personal config is absent or lacks the model.
+ */
+export function personalModelSpec(providerId, modelId) {
+    const personal = loadPersonalModels();
+    if (!personal)
+        return null;
+    const pid = configProviderIdFor(providerId);
+    const key = `${pid}\\${modelId}`;
+    const contextWindow = personal.contextByModel.get(key);
+    const reasoningValues = personal.reasoningByModel.get(key);
+    if (contextWindow === undefined && !reasoningValues)
+        return null;
+    return { contextWindow, reasoningValues };
 }
 /**
  * Fallback defaults for when config.json is unreadable or has no enabled
@@ -80,9 +146,44 @@ function isLocalBaseURL(url) {
     }
 }
 /**
- * Collect models from config.json for the dropdown.
+ * Append providers that exist ONLY in provider_config.json — added in the
+ * desktop app after config.json stopped syncing. Credentials come from the
+ * rule itself (`config.access.apiKey` / `config.api.baseUrl`), selectability
+ * follows the same rule as config.json entries (#156).
+ */
+function appendPersonalOnlyProviders(out, personal, pinned) {
+    const known = new Set(out.map((m) => m.providerId));
+    for (const { pid, rule } of personal.providers) {
+        if (known.has(pid))
+            continue;
+        if (pinned && pid !== pinned)
+            continue;
+        const synthesized = {
+            name: rule.providerName,
+            enabled: rule.enabled,
+            options: {
+                apiKey: rule.config?.access?.apiKey,
+                baseURL: rule.config?.api?.baseUrl,
+            },
+        };
+        if (!providerSelectable(pid, synthesized))
+            continue;
+        const providerName = rule.providerName ?? pid;
+        for (const modelId of personal.modelsByProvider.get(pid) ?? []) {
+            out.push({ providerId: pid, providerName, modelId });
+        }
+    }
+}
+/**
+ * Collect models from config.json for the dropdown, UNIONED with the desktop's
+ * provider_config.json (3.12+): models the user added in the desktop app land
+ * there and never reach legacy config.json, so without the merge the dropdown
+ * silently misses them (observed 2026-09). config.json stays authoritative for
+ * provider enablement/credentials; the personal config contributes model ids
+ * per provider, plus whole providers it describes and config.json does not.
  */
 export function loadAllModels() {
+    const personal = loadPersonalModels();
     try {
         const cfg = readConfig();
         const out = [];
@@ -94,10 +195,15 @@ export function loadAllModels() {
             if (!providerSelectable(pid, p))
                 continue;
             const providerName = p.name ?? pid;
-            for (const modelId of Object.keys(p.models ?? {})) {
+            const ids = new Set(Object.keys(p.models ?? {}));
+            for (const modelId of personal?.modelsByProvider.get(pid) ?? [])
+                ids.add(modelId);
+            for (const modelId of ids) {
                 out.push({ providerId: pid, providerName, modelId });
             }
         }
+        if (personal)
+            appendPersonalOnlyProviders(out, personal, pinned);
         // The default-provider fallback applies only to a MISSING/empty provider
         // map (fresh install). When providers ARE configured but none is usable
         // (all keyless/未启用, #156), returning [] is correct: the fallback would
@@ -115,6 +221,13 @@ export function loadAllModels() {
         return out;
     }
     catch {
+        // config.json unreadable — a personal-config-only setup still advertises
+        // its providers before the fresh-install default kicks in.
+        const out = [];
+        if (personal)
+            appendPersonalOnlyProviders(out, personal, process.env.ZCODE_PROVIDER);
+        if (out.length > 0)
+            return out;
         return [
             {
                 providerId: DEFAULT_PROVIDER_ID,
@@ -138,17 +251,22 @@ export function findProviderConfig(providerId) {
         return null;
     }
 }
-/** Read the context-window size for a provider+model from config.json. */
+/** Read the context-window size for a provider+model: config.json first, then
+ *  the desktop's provider_config.json (models added there carry
+ *  `config.properties.contextWindow` and never reach config.json). */
 export function modelContextWindow(providerId, modelId) {
+    const pid = configProviderIdFor(providerId);
     try {
         const cfg = readConfig();
-        const entry = cfg.provider?.[configProviderIdFor(providerId)];
-        const models = entry?.models ?? {};
-        return models[modelId]?.limit?.context ?? 0;
+        const models = cfg.provider?.[pid]?.models ?? {};
+        const hit = models[modelId]?.limit?.context;
+        if (hit && hit > 0)
+            return hit;
     }
     catch {
-        return 0;
+        // fall through to the personal config
     }
+    return personalModelSpec(pid, modelId)?.contextWindow ?? 0;
 }
 /** Builtin providerIds are prefixed with `builtin:` (e.g. `builtin:bigmodel`). */
 export function isBuiltinProvider(providerId) {
@@ -442,22 +560,45 @@ export async function buildConfigOptions(server, zcodeSid, receiverRoot) {
  * Returns `{ kind, currentValue, options }` so the caller can emit the update
  * notifications, or null when the configId is unknown / model switch fails.
  */
-export async function setConfigOption(server, zcodeSid, configId, value) {
+export async function setConfigOption(server, zcodeSid, configId, value, acpSid) {
     if (configId === "model") {
         const { applyModelSwitch } = await import("./runtime-model.js");
         const ok = await applyModelSwitch(server, zcodeSid, value);
         if (!ok)
             return null;
+        rememberModelChoice(server, acpSid, zcodeSid, { model: value });
         return { kind: "model", currentValue: value };
     }
     const dispatch = CONFIG_DISPATCH[configId];
     if (!dispatch)
         return null;
-    const backend = server.ensureBackend();
+    const backend = await server.ensureBackend();
     const resp = await backend.request(server.nextId(), dispatch.method, { sessionId: zcodeSid, [dispatch.paramKey]: value }, 15000);
     if (resp.error)
         return null;
+    if (configId === "thought") {
+        rememberModelChoice(server, acpSid, zcodeSid, { thought: value });
+    }
     return { kind: configId, currentValue: value };
+}
+/**
+ * Record the session's model/thought choice: in-memory per zcodeSid (read by
+ * the post-resume re-assert) and durably per acpSid in the lazy-alias store
+ * (read back after a bridge restart). See LazySessionRecord.modelChoice for
+ * why the backend's own persistence cannot be trusted here.
+ */
+export function rememberModelChoice(server, acpSid, zcodeSid, patch) {
+    // `at` arbitrates multi-alias recovery (newer-wins in ensureRealSession):
+    // two windows can hold records for the SAME backend session, and a stale
+    // store record must not overwrite a fresher in-memory choice on re-seed.
+    const at = Date.now();
+    server.sessionModelChoices.set(zcodeSid, {
+        ...server.sessionModelChoices.get(zcodeSid),
+        ...patch,
+        at,
+    });
+    if (acpSid)
+        recordModelChoice(acpSid, { ...patch, at });
 }
 /** Emit a config_option_update (+ current_mode_update for mode) after a change.
  *  Returns the rebuilt options (+ the advertised currentModeId for mode) so the
@@ -513,7 +654,10 @@ export async function emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, kind)
         try {
             const read = await sessionRead(server, zcodeSid);
             const proj = (read.projection ?? {});
-            const used = proj.contextUsed || proj.totalTokenCount || 0;
+            // Occupancy only (#228): totalTokenCount is lifetime consumption, never
+            // a meter. This refresh exists to re-show SIZE after the switch; used
+            // reads 0 until the backend reports real occupancy.
+            const used = proj.contextUsed ?? 0;
             // The rebuilt options[0] (model) currentValue is the just-switched value.
             const modelOpt = options.find((o) => o.id === "model");
             const { providerId, modelId } = parseModelValue(String(modelOpt?.currentValue ?? ""));
@@ -532,8 +676,11 @@ export async function emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, kind)
 }
 // ---------- helpers ----------
 async function sessionRead(server, zcodeSid) {
-    const backend = server.ensureBackend();
-    const resp = await backend.request(server.nextId(), "session/read", { sessionId: zcodeSid }, 5000);
+    const backend = await server.ensureBackend();
+    const resp = await backend.request(server.nextId(), "session/read", 
+    // messageLimit: callers read settings/projection only; the cap stops the
+    // backend from serializing the session's whole message array for them.
+    { sessionId: zcodeSid, messageLimit: 1 }, 5000);
     if (resp.error)
         throw new Error(resp.error.message);
     return (resp.result ?? {});

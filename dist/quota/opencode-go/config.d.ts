@@ -3,26 +3,31 @@
  * fallback source.
  *
  * Full precedence (highest first), resolved in ../index.ts:
- *   1. `quota.opencodeGoWorkspaceId` / `quota.opencodeGoAuthCookie` in
- *      `~/.config/zcode-acp/config.json` (our own config).
- *   2. `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` env vars
- *      (best for CI / scripts / temporary overrides).
- *   3. `~/.pi/agent/opencode-go.json` — `{ workspaceId, authCookie }`
- *      (the convention used by the @beyona/pi-zai-usage Pi extension, kept so
- *      users who already configured it there get reuse for free).
+ *   1. `quota.opencodeGoWorkspaceId` / `opencodeGoAuthCookie` /
+ *      `opencodeGoSessionToken` in `~/.config/zcode-acp/config.json` (our own
+ *      config).
+ *   2. `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` /
+ *      `OPENCODE_GO_SESSION_TOKEN` env vars (best for CI / scripts /
+ *      temporary overrides).
+ *   3. `~/.pi/agent/opencode-go.json` —
+ *      `{ workspaceId, authCookie, sessionToken }` (the convention used by
+ *      the @beyona/pi-zai-usage Pi extension, kept so users who already
+ *      configured it there get reuse for free).
  *
- * Both fields must resolve to a valid pair — a missing/invalid one yields
- * `not_configured`.
+ * All three fields must resolve to a valid triple — a missing/invalid one
+ * yields `not_configured`.
  */
 /** Env var names — documented in the CLI help and README. */
 export declare const ENV_WORKSPACE_ID = "OPENCODE_GO_WORKSPACE_ID";
 export declare const ENV_AUTH_COOKIE = "OPENCODE_GO_AUTH_COOKIE";
+export declare const ENV_SESSION_TOKEN = "OPENCODE_GO_SESSION_TOKEN";
 /** Config file path (matches the @beyona/pi-zai-usage convention). */
 export declare const CONFIG_PATH: string;
 /** Shape of the JSON config file. */
 interface OpencodeGoConfig {
     workspaceId?: string;
     authCookie?: string;
+    sessionToken?: string;
 }
 /**
  * Read (best-effort) the JSON config file. Returns an empty object on any

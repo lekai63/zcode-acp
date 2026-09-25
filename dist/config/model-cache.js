@@ -57,9 +57,10 @@ export async function emitInitialUsage(server, cx, acpSid, zcodeSid, differ) {
     try {
         const read = await sessionRead(server, zcodeSid);
         const proj = (read.projection ?? {});
-        // `||` (not `??`): an explicit contextUsed=0 is falsy and should fall back
-        // to totalTokenCount, matching Python's `proj.get("contextUsed",0) or ...`.
-        const used = proj.contextUsed || proj.totalTokenCount || 0;
+        // Occupancy only (#228): totalTokenCount is lifetime consumption — never
+        // a context meter. contextUsed absent/0 → nothing trustworthy to show
+        // yet; the completion diff reports real occupancy once turns run.
+        const used = proj.contextUsed ?? 0;
         if (!used)
             return; // resume before any turn: skip to avoid showing 0.
         // Configured limit wins over the projection's contextWindow — the
@@ -76,8 +77,11 @@ export async function emitInitialUsage(server, cx, acpSid, zcodeSid, differ) {
     }
 }
 async function sessionRead(server, zcodeSid) {
-    const backend = server.ensureBackend();
-    const resp = await backend.request(server.nextId(), "session/read", { sessionId: zcodeSid }, 5000);
+    const backend = await server.ensureBackend();
+    const resp = await backend.request(server.nextId(), "session/read", 
+    // messageLimit: callers read settings/projection only; the cap stops the
+    // backend from serializing the session's whole message array for them.
+    { sessionId: zcodeSid, messageLimit: 1 }, 5000);
     if (resp.error)
         throw new Error(resp.error.message);
     return (resp.result ?? {});

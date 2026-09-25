@@ -39,7 +39,11 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { log, warn } from "../utils.js";
-/** The one and only env switch. Every other knob is project config. */
+import { globalSandboxEnabled } from "../config/settings.js";
+/**
+ * The global env/config switch (`ZCODE_ACP_SANDBOX`, or `sandbox.enabled` in
+ * the user config file). Every other knob is project config.
+ */
 export const SANDBOX_ENV = "ZCODE_ACP_SANDBOX";
 /** Regenerable cache dirs trusted as default-writable (ADR-0011). */
 const DEFAULT_CACHE_DIRS = [
@@ -362,18 +366,14 @@ export function collectSandboxWorkspaces(cwdRoots) {
         extraAllow: [...new Set(extraAllow.map(resolveReal))].filter((p) => !own.has(p)),
     };
 }
-let envDecision = null;
 let platformWarned = false;
-/** Raw env request, uncached — the non-macOS warn must fire even when the cached darwin decision is false. */
-function envWanted() {
-    const raw = process.env[SANDBOX_ENV];
-    return raw === "1" || raw === "true";
-}
-/** Env arm decision (env wanted AND darwin), cached — env can't change mid-run. */
-function sandboxEnvOn() {
-    if (envDecision === null)
-        envDecision = envWanted() && process.platform === "darwin";
-    return envDecision;
+/**
+ * Global arm request: `sandbox.enabled` in the user config file (file wins)
+ * or ZCODE_ACP_SANDBOX=1/true. Live read — a config flip mid-run is seen at
+ * the next sandboxActive call (applySandboxFlip applies it at prompt entry).
+ */
+function globalWanted() {
+    return globalSandboxEnabled();
 }
 /**
  * The project-level switch: `enabled: true` inside the workspace's sandbox
@@ -385,22 +385,20 @@ export function projectSandboxEnabled(workspaceRoot) {
     return readSandboxConfig(workspaceRoot).enabled;
 }
 /**
- * Whether the sandbox should arm for this bridge: ZCODE_ACP_SANDBOX=1
- * (global, cached) OR any given workspace root opted in via
- * sandbox.json `enabled` (project switch, re-checked per call so a flip
- * mid-run is seen). macOS-only: elsewhere a requested sandbox warns once and
- * runs unsandboxed.
+ * Whether the sandbox should arm for this bridge: the global switch
+ * (config file `sandbox.enabled` or ZCODE_ACP_SANDBOX=1) OR any given
+ * workspace root opted in via sandbox.json `enabled` (project switch,
+ * re-checked per call so a flip mid-run is seen). macOS-only: elsewhere a
+ * requested sandbox warns once and runs unsandboxed.
  */
 export function sandboxActive(roots = [process.cwd()]) {
-    if (sandboxEnvOn())
-        return true;
-    const wanted = envWanted() || [...roots].some(projectSandboxEnabled);
+    const wanted = globalWanted() || [...roots].some(projectSandboxEnabled);
     if (!wanted)
         return false;
     if (process.platform !== "darwin") {
         if (!platformWarned) {
             platformWarned = true;
-            warn(`sandbox: requested (${SANDBOX_ENV}=1 or project config) but Seatbelt is macOS-only — running WITHOUT sandbox`);
+            warn(`sandbox: requested (${SANDBOX_ENV}=1, config file, or project config) but Seatbelt is macOS-only — running WITHOUT sandbox`);
         }
         return false;
     }
@@ -408,7 +406,6 @@ export function sandboxActive(roots = [process.cwd()]) {
 }
 /** Test hook: reset cached decisions and warn-once sets. */
 export function resetSandboxDecisionForTest() {
-    envDecision = null;
     platformWarned = false;
     templateFailedRoots.clear();
     warnedConfigIssues.clear();

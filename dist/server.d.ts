@@ -8,6 +8,7 @@
  */
 import type * as acp from "@agentclientprotocol/sdk";
 import { ZcodeBackend } from "./backend/index.js";
+import { type WorkflowGate } from "./config/workflow-gate.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { SandboxRestartBatcher } from "./handlers/sandbox-allow.js";
 import { SubagentTracker } from "./handlers/subagents.js";
@@ -32,6 +33,13 @@ export interface PendingTurn {
     cancelled: boolean;
     /** Set once session/stop has been fired for this turn, to avoid re-sending. */
     stopSent?: boolean;
+    /**
+     * True once the backend ACCEPTED this turn's session/send — the turn may
+     * own a running generation from that moment (its turn.started can lag or,
+     * on a deaf stream, never arrive). stopBackendTurn's compaction guard only
+     * spares turns whose send was NEVER accepted: those own nothing.
+     */
+    sendAccepted?: boolean;
     /**
      * Foreground execution id from the backend's `turn.started` payload. The
      * v4/command stop targets it — session/stop alone is ignored by the Aug-28
@@ -58,6 +66,15 @@ export interface PendingTurn {
      * current ticket on the respawned backend" instead of a user ESC pause.
      */
     sandboxRestart?: boolean;
+    /**
+     * Set when the turn was rejected because a detached auto-compact held the
+     * backend prompt lock (busy 1308): the send was never delivered and the
+     * caller told the user to resend. The goal-loop driver keys its
+     * wait-and-retry off this flag — runOneTurn never queues behind a
+     * compaction (the queued listener would inherit the compaction's whole
+     * internal-turn stream as residue).
+     */
+    compactRejected?: boolean;
 }
 /**
  * How long a "loaded in backend" verification stays trusted. The backend
@@ -131,6 +148,98 @@ export declare class ZcodeAcpServer {
      * in the middle").
      */
     readonly resumeInFlight: Map<string, Promise<unknown>>;
+    /**
+     * Backend session ids whose last settle poll hit RESUME_SETTLE_CAP_MS while
+     * hydration was still growing (see fetchMessagesSettled): a later plain
+     * session/messages read can still land mid-restore, so already-live load /
+     * resume paths re-settle before replaying (fetchMessagesForReplay). Cleared
+     * by any settle that reaches two stable reads.
+     */
+    readonly hydrationUnsettled: Set<string>;
+    /**
+     * Largest session/messages snapshot length ever observed by a settle for a
+     * backend session id. A re-settle (marker armed by a capped settle) treats
+     * one non-growing read that reaches this watermark as caught-up: big
+     * sessions' reads take seconds each, and demanding the full two-stable
+     * plateau inside the cap again meant the marker never cleared — every
+     * session/load re-paid a capped settle (observed 2026-09-20 on a 7413-
+     * message session: 22–56s loads). Reset on backend respawn — a rehydrating
+     * session starts growing from zero again.
+     */
+    readonly hydrationWatermark: Map<string, number>;
+    /**
+     * Backend session ids with a compaction in flight — detached auto-compact
+     * (see runAutoCompactDetached in config/auto-compact.ts) AND manual
+     * /compact or direct session/compact calls (extensions.ts compact()
+     * registers the same flag). The turn that armed it has already returned —
+     * cancel/preempt must not touch the compaction, the drain gate must not
+     * escalate on it, a concurrent prompt HOLDS on this flag instead of racing
+     * the compact lock, and a busy-retry extends its budget to the compaction
+     * settle bound instead of failing.
+     */
+    readonly autoCompactInFlight: Set<string>;
+    /**
+     * Last compact terminal state per backend session id, recorded from the
+     * backend's `state.updated` notification (reasons `session_compacted` /
+     * `session_compact_cancelled` / `session_compact_failed`) — the RPC ack
+     * alone cannot distinguish success from a swallowed background failure
+     * (see ZcodeBackend.onCompactOutcome).
+     */
+    readonly compactOutcomes: Map<string, {
+        reason: string;
+        at: number;
+    }>;
+    /**
+     * Last model/thought choice per backend session id (config spelling), set
+     * by every switch path (setConfigOption + the setModel/setThoughtLevel
+     * extensions) and re-applied after every resume — the backend's own
+     * selection entry can be lost (see LazySessionRecord.modelChoice), and a
+     * resumed session silently reverts to the workspace default while the
+     * editor dropdown still shows the user's choice. Survives backend
+     * respawns on purpose (it is per-session, not per-process state).
+     */
+    readonly sessionModelChoices: Map<string, {
+        model?: string;
+        thought?: string;
+        at?: number;
+    }>;
+    /**
+     * True once THIS backend process rejected a session/send with the
+     * whole-turn busy error (-32010 "A prompt is already running for this
+     * session"). 0.16.9 source semantics (sendPrompt's activeAbortController
+     * guard, server-operations.ts): the busy window spans the ENTIRE turn, so
+     * a mid-turn send can never be silently accepted as steer — while set, the
+     * prompt path skips the drain gate's pre-send poll and lets the send
+     * busy-retry loop be the single readiness authority. 0.16.5 accepts
+     * mid-generation sends as (silently dropped) steer input, so backends
+     * that never showed the rejection keep the full drain gate. Behavioral
+     * evidence only — no version sniffing. Reset on backend respawn.
+     */
+    observedSendBusyReject: boolean;
+    /**
+     * Dynamic-workflow gate verdict for the CURRENT backend generation
+     * (desktop-host parity, src/config/workflow-gate.ts): an anonymous remote
+     * read resolved ONCE per backend spawn and pinned to that instance — a
+     * server-side mode flip lands at the next respawn. session/create·resume
+     * params await it (workflowFlag in handlers/session.ts); the process-wide
+     * policy push chains off it in ensureBackend. Null before the first spawn
+     * reads as disabled (fail-closed).
+     */
+    backendWorkflowGate: Promise<WorkflowGate> | null;
+    /**
+     * The full slash-command list (set once by buildAgentApp in index.ts).
+     * Read by the gate-aware menu catch-up (resendMenuAfterGateSettled in
+     * handlers/session.ts): a cold bridge's session/new snapshot predates the
+     * workflow verdict, so the materialization path re-sends the menu once the
+     * gate has settled.
+     */
+    allCommands: Array<{
+        name: string;
+        description: string;
+        input?: {
+            hint: string;
+        };
+    }> | null;
     /**
      * Sandbox dynamic-allow state (ADR-0011): realpaths granted for this
      * bridge lifetime ("仅此一次" answers) — folded into the Seatbelt profile
@@ -234,8 +343,22 @@ export declare class ZcodeAcpServer {
      * spend it — prompts from other attached clients (a phone app racing the
      * boot window) never disarm it. Null once spent or when the auto-submit was
      * lost (the same connection's first prompt was something else).
+     *
+     * Armed ONLY for a MARTTY connection (marttyConnectionRoots — the
+     * per-connection identity, NOT the sticky process flag): the create-bind
+     * path lets an attaching phone's session/new claim the same bind, and a
+     * sticky-gated arm there re-pointed the handshake at the phone — the TUI's
+     * auto-submitted trigger then missed the ack and reached the model
+     * (observed live from the mobile app, 2026-09-23).
      */
     bootResumeTriggerConnection: unknown;
+    /**
+     * Per-connection `connectionContext` roots that have already submitted at
+     * least one prompt. Backs the unarmed trigger fallback in runPrompt: a
+     * martty connection's FIRST prompt is a candidate for the banner
+     * handshake; anything after it is real user input.
+     */
+    readonly connectionPromptSeen: Set<unknown>;
     /**
      * Hub session-create binding (remote create, ADR-0016): when the hub
      * incubates a TUI for a remote session-create it pre-generates the ACP
@@ -375,6 +498,15 @@ export declare class ZcodeAcpServer {
      * short command with no progress, so the result emits output once).
      */
     readonly terminalSentData: Map<string, string>;
+    /**
+     * Backend toolCallIds whose ACP tool card has been dispatched to clients
+     * (backend callId → acp card id; identical on the live dispatch path). Feeds
+     * the workflow-run guard in BackgroundTaskListener: a workflow background
+     * task folds its progress into the CreateWorkflow card only when that card
+     * is actually visible — otherwise the generic [background] card remains.
+     * Bounded FIFO (old ids age out; callIds are never reused by the backend).
+     */
+    readonly dispatchedToolCalls: Map<string, string>;
     /** Monotonic id counter; base 10_000_000 to avoid collisions with zcode-originated ids. */
     private msgCounter;
     /**
@@ -391,14 +523,26 @@ export declare class ZcodeAcpServer {
     /** Next JSON-RPC id for messages we send to zcode. */
     nextId(): number;
     /**
+     * Record that the ACP card for a backend tool call was dispatched (called
+     * from dispatchEvent's ToolCallNew branch). Bounded: when the cap is hit the
+     * oldest id ages out — a workflow run arms its poller within seconds of the
+     * card appearing, so stale entries are irrelevant.
+     */
+    noteDispatchedToolCall(backendCallId: string, acpCallId: string): void;
+    /**
      * Lazily spawn the zcode backend on first use (initialize doesn't need it).
      * With the sandbox armed (ZCODE_ACP_SANDBOX=1 globally, or any live
      * workspace's .zcode/acp/sandbox.json — ADR-0011), the spawn is wrapped in
      * a Seatbelt profile built from the live workspace roots — session/new
      * records cwds before any backend RPC (lazy placeholders), so the whitelist
      * is complete by the time the backend materializes here.
+     *
+     * Async because the spawn env completes from a login-shell probe that must
+     * never run synchronously (it would freeze this process's event loop for the
+     * probe's full timeout). The in-flight probe is shared, so concurrent
+     * callers pay for ONE shell.
      */
-    ensureBackend(): ZcodeBackend;
+    ensureBackend(): Promise<ZcodeBackend>;
     /**
      * Mark every in-flight turn cancelled — used right before killing the
      * backend WHOLESALE (sandbox arm-flip / allow restart). Those turn loops
@@ -480,13 +624,13 @@ export declare class ZcodeAcpServer {
      * forwarded to the client. The turn loop's own listener coexists via the
      * backend's per-session listener Set.
      */
-    ensureBackgroundListener(zcodeSid: string): BackgroundTaskListener;
+    ensureBackgroundListener(zcodeSid: string): Promise<BackgroundTaskListener>;
     /**
      * Ensure a sub-agent tracker is registered for the session. Idempotent, and
      * re-registers on a replaced backend instance exactly like
      * ensureBackgroundListener. Called from that same registration site.
      */
-    ensureSubagentTracker(zcodeSid: string): SubagentTracker;
+    ensureSubagentTracker(zcodeSid: string): Promise<SubagentTracker>;
     /** The live backend instance, or null when none was spawned yet. */
     currentBackend(): ZcodeBackend | null;
     /**

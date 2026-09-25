@@ -33,6 +33,7 @@
 import { randomUUID } from "node:crypto";
 import { messages } from "../i18n.js";
 import { log, warn } from "../utils.js";
+import { armWorkflowRunPoller, stopWorkflowRunPoller } from "../workflow/poller.js";
 /** Map a zcode background task status string to an ACP ToolCallStatus. */
 function toAcpStatus(status) {
     if (status === "completed")
@@ -73,7 +74,10 @@ export class BackgroundTaskListener {
             }
             if (event.type === "turn.started") {
                 const inputSource = event.payload?.["inputSource"];
-                const turnId = event.payload?.["turnId"] ?? "";
+                // Envelope-first (0.16.9); the payload spelling is the legacy fallback.
+                const turnId = event.turnId ??
+                    event.payload?.["turnId"] ??
+                    "";
                 if (inputSource === "background_task") {
                     this.activeNotifyTurnId = turnId || null;
                     // Publish the window: the prompt path extends its send busy-retry
@@ -118,6 +122,50 @@ export class BackgroundTaskListener {
         const taskId = p.taskId;
         const status = p.status ?? "running";
         const acpStatus = toAcpStatus(status);
+        // Dynamic-workflow run (taskKind "workflow"; taskId ≡ runId upstream).
+        // The fold-vs-fallback decision is made ONCE at first sight and stored on
+        // the tracked task — never re-evaluated against dispatchedToolCalls on
+        // later events: that registry is a bounded FIFO (2048) whose entries age
+        // out mid-run, and re-evaluating would mint a second card beside the
+        // CreateWorkflow one. Settings-launched runs dispatch NO live tool event
+        // (their CreateWorkflow call is synthetic upstream), so the fallback
+        // [background] card is a first-class fold target too: the poller arms
+        // against whichever card exists — this listener is the single arm point
+        // for both launch paths.
+        if (p.taskKind === "workflow") {
+            const tracked = this.tasks.get(taskId);
+            if (tracked?.foldedIntoToolCard) {
+                if (acpStatus !== "in_progress")
+                    stopWorkflowRunPoller(taskId);
+                // Sticky: the CreateWorkflow card's own tool events own the lifecycle;
+                // no [background] card now or later.
+                return;
+            }
+            if (!tracked) {
+                const cardId = p.toolCallId ? this.server.dispatchedToolCalls.get(p.toolCallId) : undefined;
+                if (cardId) {
+                    this.tasks.set(taskId, {
+                        acpCallId: cardId,
+                        foldedIntoToolCard: true,
+                        reusesLaunchCard: false,
+                        description: p.description ?? "",
+                        lastStatus: "",
+                    });
+                    if (acpStatus !== "in_progress")
+                        stopWorkflowRunPoller(taskId);
+                    else {
+                        armWorkflowRunPoller(this.server, this.zcodeSid, { runId: taskId, toolCallId: cardId });
+                    }
+                    log(`  [bg] workflow run ${taskId.slice(-12)} → progress folded into card ${cardId.slice(-12)}`);
+                    return;
+                }
+            }
+            if (acpStatus !== "in_progress")
+                stopWorkflowRunPoller(taskId);
+            // Not folded (no visible card at first sight, or already tracked as a
+            // background card) → fall through to the generic background-card path;
+            // the mint site arms the poller against the bg card's own id.
+        }
         let task = this.tasks.get(taskId);
         if (!task) {
             // First sighting → decide whether to reuse the launch card or mint a
@@ -171,6 +219,17 @@ export class BackgroundTaskListener {
             task.lastStatus = acpStatus;
             if (ok) {
                 log(`  [bg] task card emitted: ${taskId.slice(-12)} status=${acpStatus}`);
+            }
+            // Workflow run with no visible tool card (settings-launched runs never
+            // dispatch one): the bg card IS the progress surface — arm the poller
+            // against its own acpCallId so the run's journal lines land on it.
+            // In-progress only: a first sighting that is already terminal has
+            // nothing left to poll.
+            if (p.taskKind === "workflow" && acpStatus === "in_progress") {
+                armWorkflowRunPoller(this.server, this.zcodeSid, {
+                    runId: taskId,
+                    toolCallId: task.acpCallId,
+                });
             }
             return;
         }

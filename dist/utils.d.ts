@@ -24,12 +24,33 @@ export declare function zcodeHomeDir(): string;
  */
 export declare const ZCODE_CREDS_PATH: string;
 /**
+ * Path to the desktop's personal provider config (3.12+): the desktop writes
+ * user-added providers and models HERE, and the backend registry reads it
+ * directly — legacy config.json's provider map stopped syncing. Per call, so
+ * discovery follows a `ZCODE_HOME` change made after import (tests).
+ */
+export declare function zcodePersonalProviderPath(): string;
+/**
  * Path to the ZCode CLI config (skills/plugins/MCP enablement). Per call, so
  * discovery follows a `ZCODE_HOME` change made after import (tests).
  */
 export declare function zcodeCliConfigPath(): string;
 /** Root of the ZCode plugin cache directory (per call — see above). */
 export declare function zcodePluginCacheDir(): string;
+/**
+ * Root of the ZCode user-scope agent definitions (`~/.zcode/agents/*.md`).
+ * Per call, so discovery follows a `ZCODE_HOME` change made after import.
+ */
+export declare function zcodeAgentsDir(): string;
+/**
+ * Path of the agent state file (`~/.zcode/v2/agents-state.json`): per-agent
+ * enablement plus the built-in agents' model overrides. Per call — see above.
+ */
+export declare function zcodeAgentsStatePath(): string;
+/** Path of the CLI agent database (`~/.zcode/cli/db/db.sqlite`) — usage stats. */
+export declare function zcodeUsageDbPath(): string;
+/** Path of the encrypted credential store (`~/.zcode/v2/credentials.json`). */
+export declare function zcodeCredentialsPath(): string;
 /**
  * Slash commands surfaced to the editor. Each maps to a ZCode session method
  * that the server forwards when the user types the command.
@@ -91,6 +112,15 @@ export declare const SLASH_COMMANDS: readonly [{
 }, {
     readonly name: "init";
     readonly description: "Create or update workspace AGENTS.md instructions";
+}, {
+    readonly name: "workflow";
+    readonly description: "Describe a dynamic multi-step workflow for the model to run";
+    readonly input: {
+        readonly hint: "<workflow description>";
+    };
+}, {
+    readonly name: "workflows";
+    readonly description: "List saved workflows and recent runs";
 }];
 /** Static metadata for the configOptions selects (model/mode/thought). */
 export declare const CONFIG_META: {
@@ -144,7 +174,9 @@ export declare const CONFIG_DISPATCH: Record<string, {
 }>;
 /** Verbose diagnostic log. Only emitted when `ZCODE_ACP_DEBUG=1`. */
 export declare function log(msg: string): void;
-/** Warning — always emitted. For perceivable failures. */
+/** Warning — always emitted. For perceivable failures. Also lands in the
+ * daily on-disk diary (`~/.zcode/cli/log/zcode-acp-<date>.log`) so a crash
+ * that takes stderr down still leaves a trace — see crash-guards.ts. */
 export declare function warn(msg: string): void;
 /**
  * Stable identity of an ACP client connection. Each request wraps the

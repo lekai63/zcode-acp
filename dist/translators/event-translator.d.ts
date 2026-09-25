@@ -5,16 +5,23 @@
  * so either can feed `dispatchEvent`. State held per-translator:
  *   - seenToolIds / toolNames / toolInputs / finalToolIds for tool lifecycle
  *   - turnStarted / turnDone / turnFailed / turnResultType / turnError for turn state
+ *     (plus turnUsage / turnCacheStats captured from the same terminal event)
  *
  * A critical quirk: zcode streams tool input via `model.streaming tool_call`
  * BEFORE the `tool.updated scheduled` event, whose `input` is then omitted
  * (`inputOmitted:true`). So we cache input from `tool_call` and fall back to
  * it when `scheduled` arrives without input.
  */
-import type { InternalEvent } from "./types.js";
+import type { InternalEvent, TurnCacheStats } from "./types.js";
 interface ZcodeEventPayload {
     type?: string;
     payload?: Record<string, unknown>;
+    /**
+     * Turn attribution from the event ENVELOPE (0.16.9 puts turnId there, not
+     * in the payload — see ZcodeEvent). The payload spelling remains as a
+     * fallback for builds that carried it inside.
+     */
+    turnId?: string;
 }
 export declare class EventTranslator {
     turnStarted: boolean;
@@ -33,6 +40,31 @@ export declare class EventTranslator {
      */
     turnUsage: Record<string, unknown> | null;
     /**
+     * cacheStats from this turn's `turn.completed` payload (prompt-cache hit
+     * counts; `cacheReadTokens` optional). Null when the backend sent none —
+     * pre-cacheStats builds omit the field. Consumed by the dispatcher to render
+     * the turn-end status line alongside the TurnInfo event.
+     */
+    turnCacheStats: TurnCacheStats | null;
+    /**
+     * The protocol layer's authoritative terminal broadcast for a session/send
+     * turn: `state.updated {reason:"prompt_completed"}` from
+     * runPromptTurnInBackground's finally (server-operations.ts:2469), and
+     * `"prompt_failed"` when the turn threw (:2445). Unlike `turn.completed` it
+     * is emitted by the protocol layer, so it survives a deaf event stream — the
+     * turn loop consults these flags in its stall branch to end a
+     * lost-terminal turn in seconds instead of waiting out STALE_FREEZE_MS
+     * (10 min).
+     *
+     * Deliberately NOT a primary terminal: the notification carries no turnId,
+     * and a prompt accepted during the previous turn's post-clear snapshot build
+     * (`afterStateMutation` awaits real I/O before emitting) could deliver a
+     * stale one to the next turn's translator. Only set after OUR
+     * `turn.started`, and only acted on after 15s of stream silence.
+     */
+    sawPromptCompleted: boolean;
+    sawPromptFailed: boolean;
+    /**
      * True while inside a background-task notification turn
      * (`turn.started {inputSource:"background_task"}`). Set on its turn.started,
      * cleared on the next user-initiated turn.started. While true, `translate`
@@ -47,6 +79,10 @@ export declare class EventTranslator {
      * the user's turn while the backend kept generating (the "ghost completed"
      * remote-status bug). turnId-less backends keep the old behavior (both ids
      * must be present for a mismatch to drop an event).
+     *
+     * Read from the event ENVELOPE (`event.turnId`) — 0.16.9's turn.* payloads
+     * are strict and carry no turnId; a payload-only read silently nulled this
+     * and the whole attribution below was dead code (fixed 2026-09-21).
      */
     private activeTurnId;
     private skippingForeignTurn;

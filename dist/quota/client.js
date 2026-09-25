@@ -31,11 +31,11 @@ export function resolveQuotaHost(baseURL) {
  *         errors. The caller maps these to `unavailable`.
  */
 export async function fetchQuotaResponse(fetchImpl = globalThis.fetch) {
-    const { ANTHROPIC_API_KEY, ZCODE_BASE_URL } = loadZcodeCredentials();
+    const { ANTHROPIC_API_KEY, providerBaseURL } = loadZcodeCredentials();
     if (!ANTHROPIC_API_KEY) {
         throw new Error("no apiKey in ZCode config — cannot query quota");
     }
-    const url = resolveQuotaHost(ZCODE_BASE_URL ?? "") + QUOTA_PATH;
+    const url = resolveQuotaHost(providerBaseURL ?? "") + QUOTA_PATH;
     const resp = await fetchImpl(url, {
         method: "GET",
         headers: {

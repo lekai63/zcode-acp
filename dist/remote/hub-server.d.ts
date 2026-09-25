@@ -188,8 +188,8 @@ export declare function resolveTerminalLaunches(prefs: TerminalPrefs): TerminalL
  * the script runs in a fresh shell spawned by the terminal app, which
  * inherits launchd's environment — NOT the hub's — so without them the TUI
  * would boot as a plain local session and never register back (the
- * incubation would stall into its timeout). Everything ZCODE_ACP_* travels;
- * values are single-quoted.
+ * incubation would stall into its timeout). Everything ZCODE_ACP_* travels,
+ * plus the MARTTY_PASSTHROUGH_ENV allowlist; values are single-quoted.
  */
 export declare function terminalTuiScript(cwd: string, cliJs: string, env: NodeJS.ProcessEnv): string;
 /**

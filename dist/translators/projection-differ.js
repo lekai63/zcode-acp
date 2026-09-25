@@ -29,6 +29,18 @@ export class ProjectionDiffer {
     seenMessageIds = new Set();
     lastPlanSig = "__none__";
     seenPatchHashes = new Set();
+    /**
+     * Id of the newest message this differ has baselined. Turn-internal reads
+     * scope themselves with `session/messages`' native `afterMessageId` cursor
+     * instead of re-transferring the whole store — everything before the anchor
+     * is either already seen or frozen history the differ never re-emits.
+     *
+     * markSeen takes the last id of the list it is given, so callers pass
+     * either the full history (turn entry) or a post-anchor window (every
+     * re-baseline) — both end at the newest stored message. A read that failed
+     * and degraded to [] leaves the anchor untouched.
+     */
+    historyAnchor = null;
     /** Whether any TextDelta fired this turn (used by fallback detection). */
     emittedTextThisTurn = false;
     /** Mark all given messages as seen (baseline so we don't re-emit history). */
@@ -38,6 +50,11 @@ export class ProjectionDiffer {
             if (key)
                 this.seenMessageIds.add(key);
         }
+        // The list arrives in store order (session/messages is ordered by
+        // sequence/time_created), so its last id is the newest message covered.
+        const last = messages[messages.length - 1]?.info?.id;
+        if (last)
+            this.historyAnchor = last;
     }
     /** Whether a message's dedup key has already been processed. */
     hasSeenMessage(m) {
@@ -67,11 +84,16 @@ export class ProjectionDiffer {
         const events = [];
         const curProj = (curSnapshot?.projection ?? {});
         const curMsgs = curSnapshot?.messages ?? [];
-        // 1. usage_update: prefer contextUsed (current occupancy) over totalTokenCount
-        //    (cumulative). `||` so an explicit contextUsed=0 falls back to totalTokenCount.
-        const used = curProj.contextUsed || curProj.totalTokenCount || 0;
-        const size = curProj.contextWindow ?? 0;
-        if (this.lastUsage === null || used !== this.lastUsage) {
+        // 1. usage_update: contextUsed is the authoritative CURRENT occupancy. A
+        //    missing value means unknown — skip the update entirely rather than
+        //    fabricate a meter from totalTokenCount (lifetime consumption; a
+        //    multi-request turn's total can exceed the window, #228). An explicit
+        //    0 is valid (post-compaction) and IS reported; the baseline is only
+        //    advanced when a real value was seen, so an unknown snapshot never
+        //    suppresses the next real one.
+        const used = curProj.contextUsed;
+        if (typeof used === "number" && (this.lastUsage === null || used !== this.lastUsage)) {
+            const size = curProj.contextWindow ?? 0;
             if (size > 0)
                 events.push({ kind: "UsageDelta", used, size });
             this.lastUsage = used;

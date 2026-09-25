@@ -152,4 +152,30 @@ function formatEndpoint(s) {
 function pad(s, width) {
     return s.length >= width ? s : s + " ".repeat(width - s.length);
 }
+/**
+ * Format the backend's live MCP health map into a card for `/mcp`.
+ *
+ * One line per server — `name · status · N tools · failureKind` (failureKind
+ * only when present, raw enum value) — with a pending OAuth authorizationUrl
+ * indented on its own line beneath its server.
+ */
+export function formatMcpServerHealth(statuses) {
+    const m = messages();
+    const names = Object.keys(statuses).sort();
+    if (names.length === 0) {
+        return m.mcpNone;
+    }
+    const lines = [m.mcpHealthHeader(names.length), ""];
+    for (const name of names) {
+        const h = statuses[name];
+        const parts = [name, h.status, m.mcpHealthTools(h.toolCount)];
+        if (h.failureKind)
+            parts.push(h.failureKind);
+        lines.push(`  ${parts.join(" · ")}`);
+        if (h.authorizationUrl)
+            lines.push(`    ${h.authorizationUrl}`);
+    }
+    lines.push("", m.mcpFooter);
+    return lines.join("\n");
+}
 //# sourceMappingURL=mcp-discovery.js.map

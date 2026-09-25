@@ -2,8 +2,9 @@
  * Bridge-emitted user-facing strings (editor popups, status/hint lines).
  *
  * Language selection, first match wins:
- *   1. ZCODE_ACP_LANG  — explicit override ("zh", "en"; prefixes like "zh_CN"
- *      accepted, case-insensitive)
+ *   1. Explicit override — `lang` in ~/.config/zcode-acp/config.json, else
+ *      ZCODE_ACP_LANG ("zh", "en"; prefixes like "zh_CN" accepted,
+ *      case-insensitive)
  *   2. The ZCode desktop app's language choice — `localePreference` (explicit
  *      user pick), falling back to `locale` (effective), in
  *      <zcode-home>/v2/setting.json (the ZCode data root — `~/.zcode`, or
@@ -18,6 +19,7 @@
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { languageOverride } from "./config/settings.js";
 import { zcodeHomeDir } from "./utils.js";
 export function resolveLanguage(env = process.env) {
     // Non-string values (a malformed setting.json carrying `locale: 5` must
@@ -33,7 +35,7 @@ export function resolveLanguage(env = process.env) {
             return "en";
         return undefined;
     };
-    return (pick(env.ZCODE_ACP_LANG) ??
+    return (languageOverride(env) ??
         pick(appLocale()) ??
         pick(env.LC_ALL) ??
         pick(env.LC_MESSAGES) ??
@@ -90,6 +92,8 @@ const zh = {
     backendRecovered: (attempt, total) => `[后端进程异常中断，已重启并恢复会话，自动继续刚才的任务 (${attempt}/${total})…]`,
     goalBackendRecovered: "[后端进程异常中断，auto 任务已自动恢复并继续…]",
     promptQueuedBehindTurn: "[上一个回复仍在生成，等待结束后发送…]",
+    subagentStatusLine: (running, waiting, blocked) => `[子代理] ${running} 运行中${waiting ? ` · ${waiting} 等待` : ""}${blocked ? ` · ${blocked} 阻塞` : ""}`,
+    subagentEndedLine: (ended, failed, cancelled) => `[子代理完成] ${ended} 个结束${failed ? ` · ${failed} 失败` : ""}${cancelled ? ` · ${cancelled} 取消` : ""}`,
     thinkingPlaceholder: "正在思考…",
     messageSwallowedByTurn: "[消息被并入仍在生成的回合，将被丢弃，请重新发送]",
     interactionInterrupted: "交互中断：连接关闭或超时，请重新发起对话。",
@@ -105,6 +109,8 @@ const zh = {
     slashCompacted: "✓ 已压缩对话上下文",
     bootResumeAck: "⟲ 已恢复会话 · 历史已回放",
     slashCompactTimeout: "⚠ 压缩超时（300s），后端可能仍在处理——稍等片刻再发送",
+    slashCompactFailed: "⚠ 压缩失败：后端未完成上下文压缩（详见日志）",
+    slashCompactAlreadyRunning: "⏳ 已有压缩正在进行——已等待其完成",
     slashGoalSet: (v) => `✓ 目标已设置：${v}`,
     slashAutoSet: (v) => `✓ auto loop：${v}`,
     slashErrAutoArg: "/auto 需要目标描述（或 status | pause | resume | stop）",
@@ -145,6 +151,11 @@ const zh = {
     mcpFromConfig: "来自 config.json:",
     mcpFromPlugins: "来自插件:",
     mcpFooter: "MCP 工具会在需要时由模型自动调用。",
+    mcpHealthHeader: (n) => `📡 MCP 服务器 (${n}) · 后端状态`,
+    mcpHealthTools: (n) => `${n} 个工具`,
+    turnCompleted: "✓ 已完成",
+    turnCompletedCache: (c, t, r) => `✓ 已完成 · 缓存 ${c}/${t} 条消息${r ? ` · ${r} 缓存读取 token` : ""}`,
+    turnStoppedEarly: (rt) => `⚠ 提前结束：${rt}`,
     slashCommandDescriptions: {
         auto: "自治目标循环：开始、查看、暂停、恢复、停止",
         compact: "压缩对话上下文（释放 token）",
@@ -157,11 +168,18 @@ const zh = {
         resume: "在当前线程接续一个历史会话（弹窗选择）",
         mcp: "列出可用的 MCP 服务器",
         init: "创建或更新工作区 AGENTS.md 指令",
+        workflow: "描述一个动态多步工作流，交给模型执行",
+        workflows: "列出已保存的工作流与最近的运行",
     },
+    workflowDisabled: "⚠ 工作流功能当前未开放",
     autoCompactStart: (used, threshold) => `🔄 自动压缩: 上下文用量 ${used} ≥ 阈值 ${threshold},正在压缩…`,
     autoCompactTimeout: "⚠ 自动压缩超时（300s）——后端可能仍在处理",
     autoCompactDone: "✓ 自动压缩: 上下文已压缩",
     autoCompactFailed: (err) => `⚠ 自动压缩失败: ${err}`,
+    autoCompactBackendFailed: "后端报告压缩失败（session_compact_failed）",
+    autoCompactBusy: "🔄 压缩进行中，这条消息未发送；压缩完成后请重新发送。",
+    autoCompactHeld: "🔄 压缩进行中，这条消息已排队，压缩完成后会自动发送。",
+    autoCompactGoalWait: "⏳ 压缩进行中，auto 任务将在压缩结束后自动继续…",
     popupTitleExitPlan: "可以开始编码了吗？",
     popupTitleToolPermission: (tool) => `工具权限 (${tool})`,
     popupTitleInteraction: "交互",
@@ -198,6 +216,8 @@ const en = {
     backendRecovered: (attempt, total) => `[Backend process was interrupted; it has been restarted and the session restored — continuing the task (${attempt}/${total})…]`,
     goalBackendRecovered: "[Backend process was interrupted; the auto task recovered automatically and is continuing…]",
     promptQueuedBehindTurn: "[The previous reply is still generating; sending once it finishes…]",
+    subagentStatusLine: (running, waiting, blocked) => `[subagents] ${running} running${waiting ? ` · ${waiting} waiting` : ""}${blocked ? ` · ${blocked} blocked` : ""}`,
+    subagentEndedLine: (ended, failed, cancelled) => `[subagents finished] ${ended} ended${failed ? ` · ${failed} failed` : ""}${cancelled ? ` · ${cancelled} cancelled` : ""}`,
     thinkingPlaceholder: "Thinking…",
     messageSwallowedByTurn: "[The message was merged into a still-generating turn and will be dropped; please resend it.]",
     interactionInterrupted: "Interaction interrupted: the connection closed or timed out; please start the request again.",
@@ -213,6 +233,8 @@ const en = {
     slashCompacted: "✓ compacted conversation context",
     bootResumeAck: "⟲ session resumed — history replayed",
     slashCompactTimeout: "⚠ compact timed out (300s), backend may still be processing — wait a bit before sending",
+    slashCompactFailed: "⚠ compaction failed: the backend did not compress the context (see logs)",
+    slashCompactAlreadyRunning: "⏳ a compaction was already running — waited for it to finish",
     slashGoalSet: (v) => `✓ goal set: ${v}`,
     slashAutoSet: (v) => `✓ auto loop: ${v}`,
     slashErrAutoArg: "/auto requires an objective (or status | pause | resume | stop)",
@@ -253,6 +275,11 @@ const en = {
     mcpFromConfig: "From config.json:",
     mcpFromPlugins: "From plugins:",
     mcpFooter: "MCP tools are auto-invoked by the model when needed.",
+    mcpHealthHeader: (n) => `📡 MCP Servers (${n}) · backend status`,
+    mcpHealthTools: (n) => `${n} tools`,
+    turnCompleted: "✓ completed",
+    turnCompletedCache: (c, t, r) => `✓ completed · cache ${c}/${t} messages${r ? ` · ${r} cache-read tokens` : ""}`,
+    turnStoppedEarly: (rt) => `⚠ stopped early: ${rt}`,
     slashCommandDescriptions: {
         auto: "Autonomous goal loop: start, status, pause, resume, stop",
         compact: "Compress conversation context (free up tokens)",
@@ -265,11 +292,18 @@ const en = {
         resume: "Resume a past session into this thread (picker popup)",
         mcp: "List available MCP servers",
         init: "Create or update workspace AGENTS.md instructions",
+        workflow: "Describe a dynamic multi-step workflow for the model to run",
+        workflows: "List saved workflows and recent runs",
     },
+    workflowDisabled: "⚠ Dynamic workflows are not available on this account yet",
     autoCompactStart: (used, threshold) => `🔄 auto-compact: context usage ${used} ≥ threshold ${threshold}, compressing…`,
     autoCompactTimeout: "⚠ auto-compact timed out (300s) — backend may still be processing",
     autoCompactDone: "✓ auto-compact: context compressed",
     autoCompactFailed: (err) => `⚠ auto-compact failed: ${err}`,
+    autoCompactBackendFailed: "backend reported compaction failed (session_compact_failed)",
+    autoCompactBusy: "🔄 compaction in progress — this message was NOT sent; resend it once the compaction finishes.",
+    autoCompactHeld: "🔄 compaction in progress — this message is queued and will be sent automatically once it finishes.",
+    autoCompactGoalWait: "⏳ compaction in progress — the auto run continues automatically once it finishes…",
     popupTitleExitPlan: "Ready to code?",
     popupTitleToolPermission: (tool) => `tool permission (${tool})`,
     popupTitleInteraction: "interaction",

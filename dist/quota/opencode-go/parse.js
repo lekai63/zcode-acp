@@ -1,75 +1,61 @@
 /**
- * Opencode Go dashboard HTML parser.
+ * Opencode Go status JSON parser.
  *
- * The dashboard is a SolidJS SSR page. Usage data is embedded as hydration
- * assignments inside a `<script>`, in the shape:
+ * The console API (`/console/api/go/status`) returns meter pairs in
+ * micro-cents per window; we compute the percent (used/limit) and the reset
+ * countdown (resetsAt − now) here — the API gives absolute timestamps, the
+ * formatter wants a relative countdown captured at fetch time.
  *
- *   rollingUsage:$R[N]={usagePercent:<n>,resetInSec:<n>}
- *
- * (field order may vary; `$R[N]` is a Solid hydration reference). This is JS
- * source, not JSON, so we extract with regexes rather than `JSON.parse`. Two
- * independent reference implementations (pi-go-bars, @beyona/pi-zai-usage)
- * use the same approach as of 2026-08, but the format has no stability
- * contract — a frontend change will silently break extraction, which is why
- * {@link looksLikeDashboard} guards against parser rot.
+ * Window mapping:
+ *   rolling ← meters.fiveHour (resetsAt is null while the window is idle → 0)
+ *   weekly  ← meters.week
+ *   monthly ← meters.month (carries no resetsAt — anchored to access.endsAt,
+ *             the subscription renewal instant)
  */
-/** Numeric capture group: integer or decimal, optionally negative. */
-const NUM = String.raw `(-?\d+(?:\.\d+)?)`;
-/**
- * Build the two regexes for one window. Solid emits the fields in either
- * order, so we need one pattern per ordering.
- */
-function windowRegexes(name) {
-    return [
-        new RegExp(String.raw `${name}:\$R\[\d+\]=\{[^}]*usagePercent:${NUM}[^}]*resetInSec:${NUM}[^}]*\}`),
-        new RegExp(String.raw `${name}:\$R\[\d+\]=\{[^}]*resetInSec:${NUM}[^}]*usagePercent:${NUM}[^}]*\}`),
-    ];
+function microCents(v) {
+    const n = typeof v === "number" ? v : v === undefined ? Number.NaN : Number(v);
+    return Number.isFinite(n) ? n : null;
 }
-const [RE_ROLLING_PCT, RE_ROLLING_RST] = windowRegexes("rollingUsage");
-const [RE_WEEKLY_PCT, RE_WEEKLY_RST] = windowRegexes("weeklyUsage");
-const [RE_MONTHLY_PCT, RE_MONTHLY_RST] = windowRegexes("monthlyUsage");
-/**
- * Extract one window. Tries both field orderings; returns `null` if neither
- * matches or the captured numbers are not finite.
- */
-function parseWindow(html, rePct, reRst) {
-    let m = rePct.exec(html);
-    if (m) {
-        const usagePercent = Number(m[1]);
-        const resetInSec = Number(m[2]);
-        if (Number.isFinite(usagePercent) && Number.isFinite(resetInSec)) {
-            return { usagePercent, resetInSec };
-        }
+function windowFrom(meter, fallbackResetAt, now) {
+    if (!meter)
+        return null;
+    const used = microCents(meter.usedMicroCents);
+    const limit = microCents(meter.limitMicroCents);
+    if (used === null || limit === null || limit <= 0)
+        return null;
+    const usagePercent = Math.min(100, (used / limit) * 100);
+    const resetMs = meter.resetsAt ?? fallbackResetAt;
+    const at = resetMs !== undefined ? Date.parse(resetMs) : Number.NaN;
+    const resetInSec = Number.isFinite(at) ? Math.max(0, Math.round((at - now) / 1000)) : 0;
+    return { usagePercent, resetInSec };
+}
+/** Detect the status payload shape (`access.meters`) — the parser-rot guard. */
+export function looksLikeGoStatus(parsed) {
+    const meters = parsed?.access?.meters;
+    return typeof meters === "object" && meters !== null;
+}
+export function parseGoStatus(text, now = Date.now()) {
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
     }
-    m = reRst.exec(html);
-    if (m) {
-        const resetInSec = Number(m[1]);
-        const usagePercent = Number(m[2]);
-        if (Number.isFinite(usagePercent) && Number.isFinite(resetInSec)) {
-            return { usagePercent, resetInSec };
-        }
+    catch {
+        return { rolling: null, weekly: null, monthly: null, parserOutdated: false };
     }
-    return null;
-}
-/**
- * Detect whether the HTML is a dashboard page (vs. a login redirect or error
- * page). Used to distinguish "parser is outdated" from "no windows present".
- */
-export function looksLikeDashboard(html) {
-    return (html.includes("rollingUsage") || html.includes("weeklyUsage") || html.includes("monthlyUsage"));
-}
-/**
- * Parse the dashboard HTML into the three windows.
- *
- * `parserOutdated` is true when the page looks like a dashboard (contains the
- * window variable names) but none of the three windows matched — signalling
- * that the SolidJS hydration format has drifted.
- */
-export function parseGoDashboard(html) {
-    const rolling = parseWindow(html, RE_ROLLING_PCT, RE_ROLLING_RST);
-    const weekly = parseWindow(html, RE_WEEKLY_PCT, RE_WEEKLY_RST);
-    const monthly = parseWindow(html, RE_MONTHLY_PCT, RE_MONTHLY_RST);
-    const parserOutdated = rolling === null && weekly === null && monthly === null && looksLikeDashboard(html);
-    return { rolling, weekly, monthly, parserOutdated };
+    const access = parsed
+        ?.access;
+    const meters = access?.meters;
+    if (typeof meters !== "object" || meters === null) {
+        return { rolling: null, weekly: null, monthly: null, parserOutdated: false };
+    }
+    const rolling = windowFrom(meters.fiveHour, undefined, now);
+    const weekly = windowFrom(meters.week, undefined, now);
+    const monthly = windowFrom(meters.month, access?.endsAt, now);
+    return {
+        rolling,
+        weekly,
+        monthly,
+        parserOutdated: !rolling && !weekly && !monthly,
+    };
 }
 //# sourceMappingURL=parse.js.map

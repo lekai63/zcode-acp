@@ -108,6 +108,17 @@ export declare function sendAvailableCommandsPerClient(registry: ClientRegistry,
 export declare function sendAvailableCommandsDeferred(registry: ClientRegistry, sessionId: string, commands: ReadonlyArray<SlashCommandEntry>): void;
 /** Throw a JSON-RPC error from a handler (the SDK converts it to an error response). */
 export declare function throwError(code: number, message: string): never;
+/**
+ * Broadcast `$/zcode/turnState {running}` for every ACP alias of the session.
+ *
+ * The single emit path for ALL turn-state reporting — the turn loop, the
+ * cancel/early-return paths and the auto-compact busy window (which reports
+ * running:true at start and settles it only if this run raised it) — so a
+ * client that tracks only turns reads every busy window, not just model turns.
+ * `cx` targets one connection; without it the notification fans out to every
+ * attached client. Failures are per-alias and logged, never thrown.
+ */
+export declare function emitSessionTurnState(server: ZcodeAcpServer, acpSid: string, running: boolean, cx?: acp.AgentContext): Promise<void>;
 /** Server instance attached to the running agent (set by index.ts on connect). */
 export interface ServerHolder {
     server: ZcodeAcpServer;

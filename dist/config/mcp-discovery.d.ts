@@ -34,4 +34,23 @@ export declare function loadMcpServers(): McpServerInfo[];
  * Groups by source (config vs plugins) and aligns columns for readability.
  */
 export declare function formatMcpServers(servers: McpServerInfo[]): string;
+/**
+ * Per-server health from the backend `mcp/list` RPC with `mode:"status"`
+ * (zcodeMcpServerStatusSnapshot): per-server health WITHOUT connecting.
+ * `failureKind` and `authorizationUrl` are present only when set.
+ */
+export interface McpServerHealth {
+    status: string;
+    toolCount: number;
+    failureKind?: string;
+    authorizationUrl?: string;
+}
+/**
+ * Format the backend's live MCP health map into a card for `/mcp`.
+ *
+ * One line per server — `name · status · N tools · failureKind` (failureKind
+ * only when present, raw enum value) — with a pending OAuth authorizationUrl
+ * indented on its own line beneath its server.
+ */
+export declare function formatMcpServerHealth(statuses: Record<string, McpServerHealth>): string;
 //# sourceMappingURL=mcp-discovery.d.ts.map

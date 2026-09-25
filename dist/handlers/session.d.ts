@@ -17,6 +17,17 @@ import type { ZcodeMessage } from "../backend/types.js";
 import { EventTranslator, ProjectionDiffer } from "../translators/index.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 /**
+ * Cold-bridge menu catch-up: the `/` menu snapshot sent at session/new is
+ * filtered against the workflow gate, and on a COLD bridge (lazy session/new,
+ * no backend yet) that snapshot was taken while the gate was still
+ * pending/absent — the two workflow commands get dropped for that whole
+ * session. By the time a lazy session MATERIALIZES the gate has necessarily
+ * settled (create/resume params awaited it), so re-send the menu here.
+ * Overwrite semantics + the deferred helper's timer cancellation make this
+ * idempotent and correctly ordered (a late settle supersedes the stale send).
+ */
+export declare function resendMenuAfterGateSettled(server: ZcodeAcpServer, acpSid: string): void;
+/**
  * Read and consume the boot-resume session id: the first `session/new` after
  * process start claims it, the env is deleted so later `session/new` calls
  * (the TUI's /new) create fresh sessions. Whitespace-only counts as unset.
@@ -57,8 +68,15 @@ export declare function newSession(server: ZcodeAcpServer, params: acp.NewSessio
  * returns the existing mapping for already-created sessions, and concurrent
  * first-uses share a single `session/create` via the pending entry's `creating`
  * promise. Unknown ids throw.
+ *
+ * `{ensureResident:false}` (resolveResumeTarget only) skips the eviction
+ * guard for store-recovered mappings — that caller resumes the session itself
+ * immediately after, and its resume must be the one carrying the client's
+ * freshly declared mcpServers (#193).
  */
-export declare function ensureRealSession(server: ZcodeAcpServer, acpSid: string): Promise<string>;
+export declare function ensureRealSession(server: ZcodeAcpServer, acpSid: string, opts?: {
+    ensureResident?: boolean;
+}): Promise<string>;
 /** `session/list` → zcode `session/list`. */
 export declare function listSessions(server: ZcodeAcpServer, params: acp.ListSessionsRequest): Promise<acp.ListSessionsResponse>;
 /** `session/resume` → zcode `session/resume` (with runtimeModel overlay). */
@@ -284,6 +302,23 @@ export declare function extractAttachments(blocks: acp.ContentBlock[] | undefine
  */
 export declare function reloadBackendSession(server: ZcodeAcpServer, acpSid: string, zcodeSid: string): Promise<void>;
 /**
+ * Cache the FULL model-availability list from a session snapshot's
+ * `settings.model.available`.
+ *
+ * `session/create` AND `session/resume`/`fork` all return the complete list
+ * with authoritative `reasoning.defaultLevel` — only `session/read` is
+ * hardcoded to `modelAvailability:"current"` (source: server-operations.ts:1828-1831
+ * vs the option-less snapshot resume/fork get at :1518-1521/:2323). A resume is
+ * therefore a free refresh for models added after create (a personal
+ * `provider_config.json` rule, a host account push) that the create snapshot
+ * missed: model switches resolve a target's default reasoning level from this
+ * cache, and the object form of `session/setModel` hard-fails a level-bearing
+ * model without one ("Reasoning level is required").
+ *
+ * Best-effort: an empty or missing list leaves any previous cache intact.
+ */
+export declare function cacheModelAvailability(server: ZcodeAcpServer, zcodeSid: string, result: unknown): void;
+/**
  * fetchMessages + bounded read-back settle, for paths that JUST performed a
  * resume. The backend's `session/messages` reflects only what it has hydrated
  * so far — a query landing mid-restore returns a PREFIX, and replaying that
@@ -291,9 +326,22 @@ export declare function reloadBackendSession(server: ZcodeAcpServer, acpSid: str
  * is fine once hydration finished; big sessions hydrate slowly, hence
  * "often but not always"). Poll until the count has stopped growing for TWO
  * consecutive reads (a single equal pair can be a >gap plateau inside a slow
- * hydration), capped; on the cap the largest snapshot seen wins. Only fresh
- * resumes pay the extra round-trips — an already-live session's store is
- * stable.
+ * hydration), capped; on the cap the largest snapshot seen wins. A capped
+ * exit records the session in server.hydrationUnsettled so later replay
+ * reads re-settle (fetchMessagesForReplay); a stable exit clears it.
+ *
+ * Re-settles (a marker left by a capped settle) fast-path on the WATERMARK:
+ * one non-growing read that itself reaches the largest length any settle has
+ * ever observed counts as caught-up. Demanding the full two-read plateau again
+ * meant slow-reading sessions NEVER cleared the marker — every load re-paid
+ * a capped settle (observed 2026-09-20: 22–56s loads on a 7413-message
+ * session). The confirming READ (not this flight's running max) must reach
+ * the live watermark, so a read that dips below what any settle has seen
+ * falls back to the plateau rule; watermark writes are monotonic, so a
+ * concurrent settle's higher observation is never traded down. Residual,
+ * accepted: a hydration stalling at/above the watermark across one read+gap
+ * still exits early with a prefix — bounded, and the next plain read
+ * self-heals. Watermarks reset on backend respawn (ensureBackend).
  */
 export declare function fetchMessagesSettled(server: ZcodeAcpServer, zcodeSid: string): Promise<ZcodeMessage[]>;
 /**
@@ -307,6 +355,14 @@ export declare function fetchMessagesSettled(server: ZcodeAcpServer, zcodeSid: s
  */
 export declare function isTransientSendError(message: string): boolean;
 /**
+ * A failure proving the backend no longer STORES the session at all — as
+ * opposed to "Session is not active", which only means the resident runtime
+ * was evicted and a session/resume reloads it. Matches both spellings the
+ * builds in the wild produce ("Session not found: <sid>", "Session ID 不存在"),
+ * mirroring translateResumeFailure's match.
+ */
+export declare function isSessionGoneError(e: unknown): boolean;
+/**
  * Map the backend's merged per-turn usage (`EventTranslator.turnUsage`) onto
  * the ACP `PromptResponse.usage` shape (UNSTABLE in agent-client-protocol;
  * per-turn semantics per its "Token usage for this turn" description). The
@@ -314,6 +370,17 @@ export declare function isTransientSendError(message: string): boolean;
  * reducer 0-fills them); the optional ones pass through as null when
  * unreported. Field renames: reasoningTokens→thoughtTokens,
  * cacheRead/cacheWriteTokens→cachedRead/cachedWriteTokens.
+ *
+ * The backend's inputTokens is OpenAI-style: it ALREADY contains the cache
+ * read+write tokens (verified live 2026-09-18: totalTokens == inputTokens +
+ * outputTokens on a real turn.completed frame). ACP's de-facto convention —
+ * claude-agent-acp passthrough and DeepSeek's dsh-token-meter four-bucket
+ * model alike — reports inputTokens EXCLUDING cache, and clients (martty's
+ * stats-view, Zed) compute cache hit rate as cachedRead / (input + cachedRead
+ * + cachedWrite). Forwarding the inclusive number double-counts the cache in
+ * their denominator, so normalize: inputTokens here is cache-exclusive,
+ * clamped at 0. totalTokens passes through unchanged — the backend's
+ * input+output sum IS the convention's four-bucket total, arithmetically.
  */
 export declare function toAcpTurnUsage(u: Record<string, unknown> | null): acp.Usage | undefined;
 /**
@@ -321,7 +388,8 @@ export declare function toAcpTurnUsage(u: Record<string, unknown> | null): acp.U
  * turn's usage when the backend reported one (absent otherwise — no synthetic
  * zeros). Spec fields carry the standard counters; backend extras (source,
  * modelRequestCount, web request counts) ride in `_meta.zcode.usage` per the
- * bridge's extension policy.
+ * bridge's extension policy, plus `rawInputTokens` whenever normalization
+ * changed it (reconciliation/diagnostics).
  */
 export declare function turnResult(translator: EventTranslator, stopReason: acp.StopReason): acp.PromptResponse;
 /**

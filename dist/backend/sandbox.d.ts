@@ -34,7 +34,10 @@
  * macOS-only: Seatbelt is a macOS facility. Setting the env elsewhere warns
  * once and runs unsandboxed (see sandboxActive()).
  */
-/** The one and only env switch. Every other knob is project config. */
+/**
+ * The global env/config switch (`ZCODE_ACP_SANDBOX`, or `sandbox.enabled` in
+ * the user config file). Every other knob is project config.
+ */
 export declare const SANDBOX_ENV = "ZCODE_ACP_SANDBOX";
 export interface SandboxConfig {
     /**
@@ -137,11 +140,11 @@ export declare function collectSandboxWorkspaces(cwdRoots: Iterable<string>): {
  */
 export declare function projectSandboxEnabled(workspaceRoot: string): boolean;
 /**
- * Whether the sandbox should arm for this bridge: ZCODE_ACP_SANDBOX=1
- * (global, cached) OR any given workspace root opted in via
- * sandbox.json `enabled` (project switch, re-checked per call so a flip
- * mid-run is seen). macOS-only: elsewhere a requested sandbox warns once and
- * runs unsandboxed.
+ * Whether the sandbox should arm for this bridge: the global switch
+ * (config file `sandbox.enabled` or ZCODE_ACP_SANDBOX=1) OR any given
+ * workspace root opted in via sandbox.json `enabled` (project switch,
+ * re-checked per call so a flip mid-run is seen). macOS-only: elsewhere a
+ * requested sandbox warns once and runs unsandboxed.
  */
 export declare function sandboxActive(roots?: Iterable<string>): boolean;
 /** Test hook: reset cached decisions and warn-once sets. */

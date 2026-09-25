@@ -22,6 +22,7 @@
 import { spawn } from "node:child_process";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { installCrashGuards } from "../crash-guards.js";
 import { parseHubConfig } from "../remote/config.js";
 import { sandboxBorn, selfRelaunchOutsideSandbox } from "../remote/hub-sandbox.js";
 import { startHub } from "../remote/hub-server.js";
@@ -52,6 +53,9 @@ function respawnSelf() {
     process.exit(0);
 }
 export async function main() {
+    // Crash guards first — the hub is a long-lived daemon whose death takes
+    // every remote connection with it (see src/crash-guards.ts).
+    installCrashGuards();
     const config = parseHubConfig();
     if (!config)
         process.exit(1);

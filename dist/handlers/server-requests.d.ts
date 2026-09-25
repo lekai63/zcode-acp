@@ -77,5 +77,19 @@ export interface SessionPickItem {
  * the request failed (no turn context — the slash path has no PendingTurn).
  */
 export declare function askSessionPick(server: ZcodeAcpServer, cx: acp.AgentContext, acpSid: string, items: SessionPickItem[]): Promise<string | null>;
+/**
+ * Answer an `interaction/requestProviderRuntimeHeaders` request; returns false
+ * when `method` is not that request (caller keeps its own handling).
+ *
+ * Shared by the turn-loop queue path (handleOne) and the ARRIVAL-TIME
+ * responder wired onto the backend (ZcodeBackend.providerRuntimeHeadersResponder):
+ * the backend asks before EVERY model request on a zhipu-account provider, and
+ * a request that lands while no turn loop is polling the queue — compact's
+ * internal turn, session/goal set, any backend-owned generation — timed out at
+ * the backend's 180s cap as "Captcha verification request timed out" and the
+ * compaction silently failed while the bridge still reported "✓ compressed"
+ * (observed 2026-09-19, backend log `querySource: "compact"`).
+ */
+export declare function answerProviderRuntimeHeaders(backend: ZcodeBackend, reqId: number | string, method: string, params: Record<string, unknown>): boolean;
 export {};
 //# sourceMappingURL=server-requests.d.ts.map

@@ -8,7 +8,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { RequestError } from "@agentclientprotocol/sdk";
-import { warn } from "../utils.js";
+import { log, warn } from "../utils.js";
 /**
  * Send a `session/update` notification to the client, serialized through the
  * per-session replay guard (see `enqueueSessionSend`).
@@ -263,5 +263,26 @@ export function sendAvailableCommandsDeferred(registry, sessionId, commands) {
 /** Throw a JSON-RPC error from a handler (the SDK converts it to an error response). */
 export function throwError(code, message) {
     throw new RequestError(code, message);
+}
+/**
+ * Broadcast `$/zcode/turnState {running}` for every ACP alias of the session.
+ *
+ * The single emit path for ALL turn-state reporting — the turn loop, the
+ * cancel/early-return paths and the auto-compact busy window (which reports
+ * running:true at start and settles it only if this run raised it) — so a
+ * client that tracks only turns reads every busy window, not just model turns.
+ * `cx` targets one connection; without it the notification fans out to every
+ * attached client. Failures are per-alias and logged, never thrown.
+ */
+export async function emitSessionTurnState(server, acpSid, running, cx) {
+    const targetCx = cx ?? server.clients.broadcast();
+    const results = await Promise.allSettled(server
+        .sessionAliases(acpSid)
+        .map((sid) => targetCx.notify("$/zcode/turnState", { sessionId: sid, running })));
+    for (const r of results) {
+        if (r.status === "rejected") {
+            log(`turnState notify failed: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
+        }
+    }
 }
 //# sourceMappingURL=io.js.map

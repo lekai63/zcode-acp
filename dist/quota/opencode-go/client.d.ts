@@ -1,28 +1,29 @@
 /**
- * Opencode Go dashboard HTTP client.
+ * Opencode Go status HTTP client.
  *
- * There is no JSON API for Go subscription usage. The only data source is the
- * authenticated web dashboard at `https://opencode.ai/workspace/<id>/go`,
- * which serves an HTML page with usage embedded in a SolidJS SSR hydration
- * payload. We fetch the HTML here and hand it to the parser.
+ * The Go dashboard moved off the legacy SSR page (`/workspace/<id>/go` — that
+ * URL now bounces EVERY cookie to the login page, observed 2026-09-19) onto
+ * the console at `https://opencode.ai/console/<org>/go`, backed by this JSON
+ * API. Usage arrives as micro-cents meter pairs per window; the parser turns
+ * them into percent + countdown.
  *
- * Credentials come from environment variables (set by the user) — not from
- * `~/.zcode/v2/config.json`, since Opencode Go is unrelated to the ZCode
- * provider the bridge talks to.
+ * Auth needs THREE pieces (verified against the live API 2026-09-19): the
+ * `auth` cookie, the `__Host-console_session` cookie, and the `x-org-id`
+ * header. Missing session cookie → 401, missing org header → 400; any
+ * User-Agent works (one is sent for parity with the console's own requests).
  */
-/** Build the dashboard URL for a workspace. */
-export declare function dashboardUrl(workspaceId: string): string;
+/** The console status API endpoint (the org rides the `x-org-id` header). */
+export declare function goStatusUrl(): string;
 /**
- * Fetch the Go dashboard HTML.
+ * Fetch the Go status JSON.
  *
- * @throws on non-2xx responses, network errors, or timeout. The caller maps
- *         these to `unavailable`. A redirect-to-login is NOT thrown here —
- *         the final URL is returned so the orchestrator can classify it as
+ * @throws on network errors or timeout; the caller maps these to
+ *         `unavailable`. Auth failures are NOT thrown here — the HTTP status
+ *         is returned so the orchestrator can classify 400/401/403 as
  *         `auth_error`.
  */
-export declare function fetchGoDashboard(workspaceId: string, authCookie: string, fetchImpl?: typeof globalThis.fetch): Promise<{
+export declare function fetchGoStatus(workspaceId: string, authCookie: string, sessionToken: string, fetchImpl?: typeof globalThis.fetch): Promise<{
     status: number;
     text: string;
-    finalUrl: string;
 }>;
 //# sourceMappingURL=client.d.ts.map

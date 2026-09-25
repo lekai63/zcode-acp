@@ -39,10 +39,13 @@ import { WebSocket, WebSocketServer } from "ws";
 import { resolveRuntime, runtimeSpawnParts } from "../runtime.js";
 import { sessionTabTitle } from "../terminal-title.js";
 import { AGENT_INFO, compareVersions, log, warn } from "../utils.js";
+import { tuiStatsSegments } from "../config/settings.js";
 import { readCodeFingerprint } from "./code-fingerprint.js";
 import { remoteEnabledLive, remoteTerminalPrefs } from "./config.js";
+import { envWithLoginShell } from "./login-shell-env.js";
 import { accountUsageStats } from "../handlers/account.js";
 import { BOOT_RESUME_TRIGGER } from "../handlers/session.js";
+import { createSettingsHandler } from "./settings-endpoint.js";
 import { composeQuotaDock, formatGoDockSegment, formatOcDockSegment, formatQuotaDock, } from "../quota/format.js";
 import { queryQuota } from "../quota/index.js";
 import { queryOcUsage } from "../quota/ollama-cloud/index.js";
@@ -84,7 +87,7 @@ function authorized(req, url, token) {
 function setCors(res) {
     // The web UI is deployed as a separate origin; the token is the boundary.
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
     // Custom response headers JS may read cross-origin; without this the file
     // viewer's line-window fetches cannot see X-Zcode-First-Line at all.
@@ -243,18 +246,28 @@ export function resolveTerminalLaunches(prefs) {
     });
 }
 /**
+ * Non-ZCODE_ACP_* env vars the incubation script re-exports into the
+ * terminal's fresh shell. `DSH_TUI_AUTOPROMPT` is bridge-injected (the
+ * boot-resume banner handshake); `DSH_TUI_STATS` is USER-set — martty's
+ * stats-view plugin reads it at process start to filter the composer dock
+ * (e.g. `DSH_TUI_STATS=tokens,context`). The terminal shell inherits
+ * launchd's environment, NOT the hub's or the user's interactive shell, so
+ * without this export a hub-incubated TUI window never sees the user's
+ * dock config and the dock renders every segment (statsSegments() reads
+ * undefined as "no filtering").
+ */
+const MARTTY_PASSTHROUGH_ENV = ["DSH_TUI_AUTOPROMPT", "DSH_TUI_STATS"];
+/**
  * The .command script body. The incubation env MUST be embedded as exports:
  * the script runs in a fresh shell spawned by the terminal app, which
  * inherits launchd's environment — NOT the hub's — so without them the TUI
  * would boot as a plain local session and never register back (the
- * incubation would stall into its timeout). Everything ZCODE_ACP_* travels;
- * values are single-quoted.
+ * incubation would stall into its timeout). Everything ZCODE_ACP_* travels,
+ * plus the MARTTY_PASSTHROUGH_ENV allowlist; values are single-quoted.
  */
 export function terminalTuiScript(cwd, cliJs, env) {
     const exports = Object.keys(env)
-        // DSH_TUI_AUTOPROMPT is the one non-ZCODE_ACP_* passenger: the boot-resume
-        // banner handshake (martty reads it at its own process start).
-        .filter((k) => k.startsWith("ZCODE_ACP_") || k === "DSH_TUI_AUTOPROMPT")
+        .filter((k) => k.startsWith("ZCODE_ACP_") || MARTTY_PASSTHROUGH_ENV.includes(k))
         .map((k) => `export ${k}=${shQuote(String(env[k]))}`);
     // Prefer bun --smol for the long-lived bridge (src/runtime.ts); the tokens
     // are quoted individually because the interpreter may carry flags.
@@ -784,8 +797,16 @@ export function startHub(options) {
         // terminalTuiScript exports the var into the terminal's fresh shell; the
         // detached serve spawn inherits it directly.
         const nonce = randomUUID();
+        // The login-shell completion comes FIRST so the plumbing below overrides
+        // it. This hub is a detached daemon whose birth env came from whatever
+        // spawned its bridge — an editor GUI process, which means launchd's bare
+        // PATH with no version managers in it. Without this, a session opened from
+        // a phone cannot find `pnpm` / `cargo` / `java` even though the same
+        // command works in the user's terminal. The probe is async and shared, so
+        // the hub's event loop (WS proxying, heartbeats) never freezes for it.
+        const shellEnv = await envWithLoginShell();
         const env = {
-            ...process.env,
+            ...shellEnv,
             ZCODE_ACP_REMOTE: "1",
             ZCODE_ACP_REMOTE_TOKEN: token,
             ZCODE_ACP_HUB_PORT: String(port),
@@ -807,6 +828,20 @@ export function startHub(options) {
         // would SIGTERM that UNRELATED tree's process group on its last close.
         // The terminal script re-exports its own live $$ for real TUI spawns.
         delete env.ZCODE_ACP_TUI_CLI_PID;
+        // Martty dock filter (tui.stats in the user config, DSH_TUI_STATS as the
+        // env fallback). Resolved HERE, per incubation, from a live file read:
+        // this hub is a detached daemon whose birth env predates most shell
+        // exports, so an inherited DSH_TUI_STATS would go stale the moment the
+        // user edits the preference (or would be missing entirely on a hub that
+        // never saw it). terminalTuiScript exports it into the terminal's fresh
+        // shell — launchd's environment would otherwise drop it, and martty
+        // reads the variable once at its own process start.
+        //
+        // Read from the completed env, not process.env: the fallback the user
+        // exported in their shell lives only in the login shell's environment.
+        const statsFilter = tuiStatsSegments(env);
+        if (statsFilter !== undefined)
+            env.DSH_TUI_STATS = statsFilter;
         if (kind === "resume") {
             // ADR-0017: the requested session rides the env — terminalTuiScript
             // exports every ZCODE_ACP_* var into the terminal's fresh shell, so the
@@ -848,7 +883,7 @@ export function startHub(options) {
         // falls back to the detached headless spawn. "serve" never pops a window.
         const launches = kind === "serve"
             ? []
-            : (terminalLaunches ?? resolveTerminalLaunches(remoteTerminalPrefs(process.env)));
+            : (terminalLaunches ?? resolveTerminalLaunches(remoteTerminalPrefs(env)));
         let li = 0;
         /**
          * Try launches[li..] until one OPENS; advance li past every failure and
@@ -1051,7 +1086,52 @@ export function startHub(options) {
         restart.unref();
     };
     let idleSince = null;
+    // Settings API (ADR-0025): the same handler factory the bridge mounts on its
+    // loopback server. No server is passed because settings are machine level —
+    // no session or backend state is consulted, which is also why this works
+    // with zero bridges registered.
+    const settingsHandler = createSettingsHandler();
     const wss = new WebSocketServer({ noServer: true });
+    /**
+     * Forward a request to one bridge's loopback port, relaying the response.
+     *
+     * Hop-by-hop headers are stripped and the client-side abort is the only thing
+     * that destroys the upstream: `req`'s own 'close' fires as soon as its (often
+     * empty) body drains, which is typically BEFORE the relayed response has
+     * finished writing — keying on it resets the bridge socket on every request.
+     */
+    function relayToBridge(req, res, port, path, method = req.method ?? "GET") {
+        const upstream = httpRequest({ host: "127.0.0.1", port, path, method }, (up) => {
+            const headers = { ...up.headers };
+            delete headers["transfer-encoding"];
+            delete headers["connection"];
+            res.writeHead(up.statusCode ?? 502, headers);
+            up.pipe(res);
+        });
+        upstream.on("error", () => {
+            if (res.headersSent)
+                res.destroy();
+            else {
+                res.writeHead(502, { "Content-Type": "text/plain" });
+                res.end("bridge unreachable");
+            }
+        });
+        // A mid-body upstream failure (the bridge dying after the headers were
+        // written) emits on the RESPONSE stream, not on the request — so the
+        // 'error' handler above never fires and the client would hang until its own
+        // timeout. Destroy the downstream here so the fetch rejects immediately.
+        upstream.on("response", (up) => {
+            up.on("error", () => {
+                if (!res.writableEnded)
+                    res.destroy();
+            });
+        });
+        res.on("close", () => {
+            if (!res.writableEnded)
+                upstream.destroy();
+        });
+        req.pipe(upstream);
+    }
     /**
      * Reject a WS upgrade with a real HTTP status before destroying. A bare
      * destroy leaves the client's upgrade request hanging on an opaque
@@ -1476,6 +1556,62 @@ export function startHub(options) {
             }
             return;
         }
+        // /api/settings/* — the ZCode configuration API (ADR-0025), served by the
+        // hub itself rather than proxied. The state is machine-level (files under
+        // ~/.zcode/) and no backend RPC is involved, so it works with zero bridges
+        // registered — the same reason /api/quota is hub-local. The handler is the
+        // SAME factory the bridge mounts on its loopback server, so the two routes
+        // cannot drift apart.
+        if (url.pathname.startsWith("/api/settings/")) {
+            if (!authorized(req, url, token)) {
+                res.writeHead(401, { "Content-Type": "text/plain" });
+                res.end("unauthorized");
+                return;
+            }
+            settingsHandler(req, res);
+            return;
+        }
+        // /api/instances/{id}/settings/... — the per-instance form, proxied to that
+        // bridge's loopback mount. Semantics are identical (same factory); the
+        // instance form exists so a client that is already addressing one bridge
+        // keeps a single base URL.
+        const settingsMatch = url.pathname.match(/^\/api\/instances\/([^/]+)(\/settings\/.*)$/);
+        if (settingsMatch) {
+            if (!authorized(req, url, token)) {
+                res.writeHead(401, { "Content-Type": "text/plain" });
+                res.end("unauthorized");
+                return;
+            }
+            const entry = instances.get(settingsMatch[1]);
+            if (!entry) {
+                res.writeHead(404, { "Content-Type": "text/plain" });
+                res.end("unknown instance");
+                return;
+            }
+            relayToBridge(req, res, entry.port, settingsMatch[2] + url.search);
+            return;
+        }
+        // /api/instances/{id}/backend/restart — the documented spelling of the
+        // backend restart (ADR-0025 §needs-restart). It is a bridge-side operation
+        // with no settings state of its own, so the documented URL omits the
+        // /settings/ segment; map it onto the bridge's /settings/backend/restart
+        // rather than making clients guess which prefix carries it.
+        const restartMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/backend\/restart$/u);
+        if (restartMatch && req.method === "POST") {
+            if (!authorized(req, url, token)) {
+                res.writeHead(401, { "Content-Type": "text/plain" });
+                res.end("unauthorized");
+                return;
+            }
+            const entry = instances.get(restartMatch[1]);
+            if (!entry) {
+                res.writeHead(404, { "Content-Type": "text/plain" });
+                res.end("unknown instance");
+                return;
+            }
+            relayToBridge(req, res, entry.port, "/settings/backend/restart");
+            return;
+        }
         // /api/instances/{id}/fs/... and /status — byte-level proxy to the
         // instance's loopback file/status endpoint (ADR-0004, ADR-0005). The hub
         // routes by instance id only; sessionId, path semantics, and scope checks
@@ -1512,12 +1648,14 @@ export function startHub(options) {
             req.on("close", () => upstream.destroy());
             return;
         }
-        // POST /api/instances/{id}/shutdown — terminate an APP-incubated bridge
-        // (ADR-0016/0017): remote "close session window". Only instances this
-        // hub (or a remote app via it) brought up may be killed — a serve-origin
-        // bridge or any incubation-nonce carrier. An editor-origin bridge
-        // without a nonce lives inside the user's editor; killing it would take
-        // the editor's agent connection down, so those are refused (403).
+        // POST /api/instances/{id}/shutdown — the remote "close the session
+        // window" gesture (ADR-0016/0017). For a TUI-incubated instance it tears
+        // the whole window tree down (see the tuiPid note below); for a headless
+        // serve bridge it kills just the bridge. Only instances this hub (or a
+        // remote app via it) brought up may be killed — a serve-origin bridge or
+        // any incubation-nonce carrier. An editor-origin bridge without a nonce
+        // lives inside the user's editor; killing it would take the editor's
+        // agent connection down, so those are refused (403).
         const shutdownMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/shutdown$/);
         if (shutdownMatch && req.method === "POST") {
             req.resume(); // no body — drain so the client connection closes cleanly
@@ -1537,24 +1675,53 @@ export function startHub(options) {
                 res.end("instance was not incubated remotely (editor bridge) — refusing shutdown");
                 return;
             }
-            // Degenerate pids from a malformed registration must never reach kill():
-            // pid 0 signals the hub's own process group and pid 1 the launchd root.
-            if (!Number.isInteger(entry.pid) || entry.pid <= 1 || entry.pid === process.pid) {
+            // TUI-incubated instance: the registered bridge is only the LEAF of the
+            // window's tree (cli → martty → bridge); killing it alone leaves the
+            // terminal window alive on a dead-agent error page (observed live
+            // 2026-09-19: shutdown 200'd, the window stayed). tuiPid — the
+            // incubation script's $$, exec'd into the CLI — names the whole tree:
+            // the group signal covers session-leader terminals (Terminal.app), the
+            // direct signals tear tab-hosted launches (Ghostty/Warp, where the
+            // group ESRCHs) via tui.ts's SIGTERM forward to martty. Mirrors
+            // terminateAfterFlush in session-close-endpoint.ts. Headless serve
+            // bridges (no tuiPid) keep the plain bridge kill — they have no tree.
+            const tuiPid = entry.tuiPid !== undefined &&
+                Number.isInteger(entry.tuiPid) &&
+                entry.tuiPid > 1 &&
+                entry.tuiPid !== process.pid
+                ? entry.tuiPid
+                : undefined;
+            const directPids = [...(tuiPid !== undefined ? [tuiPid] : []), entry.pid].filter((pid, i, all) => Number.isInteger(pid) && pid > 1 && pid !== process.pid && all.indexOf(pid) === i);
+            if (tuiPid !== undefined) {
+                try {
+                    process.kill(-tuiPid, "SIGTERM");
+                    log(`hub: instance ${entry.id} shutdown — SIGTERM to TUI process group ${tuiPid}`);
+                }
+                catch {
+                    // Tab-hosted launch: the group ESRCHs — the direct pids below
+                    // still tear the tree down.
+                }
+            }
+            if (directPids.length === 0) {
                 res.writeHead(409, { "Content-Type": "text/plain" });
                 res.end(`instance has no killable pid (${entry.pid})`);
                 return;
             }
-            try {
-                process.kill(entry.pid, "SIGTERM");
-            }
-            catch (e) {
-                // ESRCH = already gone; anything else is a real failure to report.
-                if (e.code !== "ESRCH") {
-                    warn(`hub: shutdown of instance ${entry.id} (pid ${entry.pid}) failed: ` +
-                        `${e instanceof Error ? e.message : String(e)}`);
-                    res.writeHead(500, { "Content-Type": "text/plain" });
-                    res.end("kill failed");
-                    return;
+            for (const pid of directPids) {
+                try {
+                    process.kill(pid, "SIGTERM");
+                    log(`hub: instance ${entry.id} (pid ${pid}) shut down from remote`);
+                }
+                catch (e) {
+                    // ESRCH = already gone (e.g. the tree died with an earlier signal);
+                    // anything else is a real failure to report.
+                    if (e.code !== "ESRCH") {
+                        warn(`hub: shutdown of instance ${entry.id} (pid ${pid}) failed: ` +
+                            `${e instanceof Error ? e.message : String(e)}`);
+                        res.writeHead(500, { "Content-Type": "text/plain" });
+                        res.end("kill failed");
+                        return;
+                    }
                 }
             }
             instances.delete(entry.id);
@@ -1645,7 +1812,18 @@ export function startHub(options) {
                     id,
                     port: bridgePort,
                     pid: typeof body.pid === "number" ? body.pid : 0,
-                    startedAt: prev?.startedAt ?? Date.now(),
+                    // The registrant's own start time when it sends one, else the hub's
+                    // clock. The sender knows its real boot instant; the hub's `Date.now()`
+                    // is skewed by however long the register took to arrive, and a bridge
+                    // whose first register is slow (a cold provider sync) would look NEWER
+                    // than a bridge that actually started after it. That ordering is
+                    // load-bearing: it is the tie-break when two bridges advertise the
+                    // same session with the same updatedAt, and the winner is the one
+                    // clients attach to. A re-registration keeps the first value seen.
+                    startedAt: prev?.startedAt ??
+                        (typeof body.startedAt === "number" && Number.isFinite(body.startedAt)
+                            ? body.startedAt
+                            : Date.now()),
                     workspace: typeof body.workspace === "string" ? body.workspace : "",
                     sessions,
                     lastSeen: Date.now(),
@@ -1654,6 +1832,9 @@ export function startHub(options) {
                     // bridges. A re-registration (heartbeat) refreshes it — a bridge's
                     // nonce never changes, so this is inert in practice.
                     ...(typeof body.nonce === "string" && body.nonce ? { nonce: body.nonce } : {}),
+                    ...(typeof body.tuiPid === "number" && Number.isInteger(body.tuiPid) && body.tuiPid > 1
+                        ? { tuiPid: body.tuiPid }
+                        : {}),
                 });
             }
             else {
