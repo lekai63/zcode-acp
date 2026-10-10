@@ -11,6 +11,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 
 import {
   builtinProviderEnv,
+  desktopAppVersionEnv,
   loadZcodeCredentials,
   mergeEnvWithCreds,
   resolveZcodeCommand,
@@ -606,6 +607,7 @@ export class ZcodeAcpServer {
       ...(await envWithLoginShell()),
       ...mergeEnvWithCreds(loadZcodeCredentials()),
       ...builtinProviderEnv(),
+      ...desktopAppVersionEnv(),
       ...zcodeDataBaseDirEnv(),
     };
     let argv = resolveZcodeCommand();
