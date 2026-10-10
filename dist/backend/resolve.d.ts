@@ -39,6 +39,28 @@ export declare const PERSONAL_PROVIDER_ENV = "ZCODE_PERSONAL_PROVIDER_CONFIG_FIL
  * ambient value is the best hint.
  */
 export declare function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv;
+/**
+ * The desktop host hands the CLI its app version as `ZCODE_APP_VERSION`
+ * (packages/desktop/src/main/desktopRuntimeEnv.ts), and the CLI stamps it on
+ * every model request: `User-Agent: ZCode/<v>`, `X-ZCode-App-Version`, and the
+ * Coding Plan signer's `X-Client-Version`, which takes
+ * `X-ZCode-App-Version ?? <CLI version>`. Launched bare, the CLI falls back to
+ * its own version, so a 3.14.0 desktop bundle reported `0.16.9` on all three
+ * (captured 2026-10-10) while the same bundle under the app reports `3.14.0`.
+ *
+ * The app version is the `version` of the bundle's `app.asar` package.json:
+ * the same root package.json the desktop build stamps into its version
+ * constant (scripts/build-metadata.mjs strips leading non-digits). The
+ * archive is `<resources>/app.asar` next to the CLI's `glm/` directory on
+ * every platform; a `zcode` launcher symlink resolves to the app binary,
+ * whose `resources/` (`../Resources/` on macOS) holds it.
+ *
+ * An explicit ZCODE_APP_VERSION wins: it is already in the inherited env, so
+ * this returns {}. A CLI outside a desktop bundle (npm, PATH installs) also
+ * gets {} and keeps reporting its own version.
+ */
+export declare const APP_VERSION_ENV = "ZCODE_APP_VERSION";
+export declare function desktopAppVersionEnv(entryArg?: string): NodeJS.ProcessEnv;
 export declare function zcodeDataBaseDirEnv(): NodeJS.ProcessEnv;
 /**
  * The backend subcommand and its flags, shared by every launch path.

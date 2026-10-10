@@ -6,7 +6,7 @@
  * so the shebang fails. We sidestep it by constructing `[node, zcode.cjs,
  * "app-server", "--stdio"]` with an explicit, sqlite-capable Node binary.
  */
-import { existsSync, readdirSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -183,6 +183,136 @@ export function builtinProviderEnv(entryArg) {
     return existsSync(personal)
         ? { [BUILTIN_PROVIDER_ENV]: found, [PERSONAL_PROVIDER_ENV]: personal }
         : { [BUILTIN_PROVIDER_ENV]: found };
+}
+// ---------- desktop app version (model-request client version) ----------
+/**
+ * The desktop host hands the CLI its app version as `ZCODE_APP_VERSION`
+ * (packages/desktop/src/main/desktopRuntimeEnv.ts), and the CLI stamps it on
+ * every model request: `User-Agent: ZCode/<v>`, `X-ZCode-App-Version`, and the
+ * Coding Plan signer's `X-Client-Version`, which takes
+ * `X-ZCode-App-Version ?? <CLI version>`. Launched bare, the CLI falls back to
+ * its own version, so a 3.14.0 desktop bundle reported `0.16.9` on all three
+ * (captured 2026-10-10) while the same bundle under the app reports `3.14.0`.
+ *
+ * The app version is the `version` of the bundle's `app.asar` package.json:
+ * the same root package.json the desktop build stamps into its version
+ * constant (scripts/build-metadata.mjs strips leading non-digits). The
+ * archive is `<resources>/app.asar` next to the CLI's `glm/` directory on
+ * every platform; a `zcode` launcher symlink resolves to the app binary,
+ * whose `resources/` (`../Resources/` on macOS) holds it.
+ *
+ * An explicit ZCODE_APP_VERSION wins: it is already in the inherited env, so
+ * this returns {}. A CLI outside a desktop bundle (npm, PATH installs) also
+ * gets {} and keeps reporting its own version.
+ */
+export const APP_VERSION_ENV = "ZCODE_APP_VERSION";
+/** Header JSON above this size is not a desktop bundle worth parsing. */
+const MAX_ASAR_HEADER_BYTES = 64 * 1024 * 1024;
+/** Parsed versions keyed by `path:size:mtime` — the header is ~7MB of JSON. */
+const asarVersionCache = new Map();
+export function desktopAppVersionEnv(entryArg) {
+    if (process.env[APP_VERSION_ENV]?.trim())
+        return {};
+    const entry = entryArg ?? process.env.ZCODE_BIN ?? discoverZcodeBin();
+    if (!entry)
+        return {};
+    let real;
+    try {
+        real = realpathSync(entry);
+    }
+    catch {
+        return {};
+    }
+    const dir = path.dirname(real);
+    const candidates = [
+        path.join(dir, "..", "app.asar"),
+        path.join(dir, "resources", "app.asar"),
+        path.join(dir, "..", "Resources", "app.asar"),
+    ];
+    for (const asar of candidates) {
+        const version = asarPackageVersion(asar);
+        if (version)
+            return { [APP_VERSION_ENV]: version };
+    }
+    return {};
+}
+function asarPackageVersion(asar) {
+    let key;
+    try {
+        const st = statSync(asar);
+        if (!st.isFile())
+            return null;
+        key = `${asar}:${st.size}:${st.mtimeMs}`;
+    }
+    catch {
+        return null;
+    }
+    const cached = asarVersionCache.get(key);
+    if (cached !== undefined)
+        return cached;
+    let version = null;
+    try {
+        version = readAsarPackageVersion(asar);
+    }
+    catch (e) {
+        log(`resolve: cannot read the app version from ${asar}: ${e instanceof Error ? e.message : e}`);
+    }
+    asarVersionCache.set(key, version);
+    if (version)
+        log(`resolve: desktop app version ${version} (from ${asar})`);
+    return version;
+}
+/**
+ * Read `package.json` → `version` from an asar archive without unpacking it.
+ *
+ * Layout: an 8-byte size pickle (`4`, header pickle size), then the header
+ * pickle (payload size, JSON byte length, JSON). File offsets in the JSON are
+ * relative to the end of the header pickle, i.e. `8 + headerPickleSize`. An
+ * entry flagged `unpacked` lives in the sibling `app.asar.unpacked/` tree.
+ */
+function readAsarPackageVersion(asar) {
+    const fd = openSync(asar, "r");
+    try {
+        const prefix = Buffer.alloc(16);
+        if (readSync(fd, prefix, 0, 16, 0) !== 16 || prefix.readUInt32LE(0) !== 4)
+            return null;
+        const headerSize = prefix.readUInt32LE(4);
+        const jsonLength = prefix.readUInt32LE(12);
+        if (jsonLength === 0 || jsonLength > headerSize || jsonLength > MAX_ASAR_HEADER_BYTES) {
+            return null;
+        }
+        const json = Buffer.alloc(jsonLength);
+        if (readSync(fd, json, 0, jsonLength, 16) !== jsonLength)
+            return null;
+        const header = JSON.parse(json.toString("utf8"));
+        const file = header.files?.["package.json"];
+        if (!file || typeof file.size !== "number" || file.size <= 0 || file.size > 1024 * 1024) {
+            return null;
+        }
+        let raw;
+        if (file.unpacked) {
+            raw = readFileSync(path.join(`${asar}.unpacked`, "package.json"));
+        }
+        else {
+            const offset = Number(file.offset);
+            if (!Number.isSafeInteger(offset) || offset < 0)
+                return null;
+            raw = Buffer.alloc(file.size);
+            if (readSync(fd, raw, 0, file.size, 8 + headerSize + offset) !== file.size)
+                return null;
+        }
+        return normalizeAppVersion(JSON.parse(raw.toString("utf8")).version);
+    }
+    finally {
+        closeSync(fd);
+    }
+}
+/** The desktop build's own normalization, plus the CLI's printable-header rule. */
+function normalizeAppVersion(value) {
+    if (typeof value !== "string")
+        return null;
+    const version = value.trim().replace(/^[^\d]*/, "");
+    return version && /^[\x20-\x7e]+$/.test(version) ? version : null;
 }
 /**
  * Translate the bridge's `ZCODE_HOME` into the backend's own data-root

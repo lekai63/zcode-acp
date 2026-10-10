@@ -6,7 +6,7 @@
  * Shared state (session map, pending turns, client capabilities) lives here so
  * every handler layer can reach it without globals.
  */
-import { builtinProviderEnv, loadZcodeCredentials, mergeEnvWithCreds, resolveZcodeCommand, zcodeDataBaseDirEnv, ZcodeBackend, } from "./backend/index.js";
+import { builtinProviderEnv, desktopAppVersionEnv, loadZcodeCredentials, mergeEnvWithCreds, resolveZcodeCommand, zcodeDataBaseDirEnv, ZcodeBackend, } from "./backend/index.js";
 import { armSandboxArgv, collectSandboxWorkspaces, sandboxActive } from "./backend/sandbox.js";
 import { captureGate, pushDynamicWorkflowPolicy, resolveWorkflowGate, } from "./config/workflow-gate.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
@@ -499,6 +499,7 @@ export class ZcodeAcpServer {
             ...(await envWithLoginShell()),
             ...mergeEnvWithCreds(loadZcodeCredentials()),
             ...builtinProviderEnv(),
+            ...desktopAppVersionEnv(),
             ...zcodeDataBaseDirEnv(),
         };
         let argv = resolveZcodeCommand();
