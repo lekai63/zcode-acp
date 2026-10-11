@@ -93,6 +93,36 @@ export interface PendingTurn {
    * internal-turn stream as residue).
    */
   compactRejected?: boolean;
+  /**
+   * Native guide-steer inputs (`_zcode/guide`, handlers/guide.ts) keyed by
+   * their v4 commandId. An entry stays until the backend consumed it
+   * (`turn.steerDrained`, or its own follow-up turn started); while any
+   * entry is open the prompt is not allowed to end.
+   */
+  guides?: Map<string, GuideEntry>;
+  /**
+   * True while this prompt's own backend turn is running (its turn.started
+   * was seen) — the only window in which a guide can attach to it. Cleared
+   * before every (re)send so a retry's backoff window refuses guides.
+   */
+  guideReady?: boolean;
+  /**
+   * Set synchronously when the prompt decided to return: a guide arriving
+   * after that has no turn to ride on and is refused (the client falls back
+   * to a regular prompt).
+   */
+  guideClosed?: boolean;
+}
+
+/** One `_zcode/guide` input; see PendingTurn.guides. */
+export interface GuideEntry {
+  commandId: string;
+  /** "sending" until the v4/command ack arrives. */
+  state: "sending" | "accepted";
+  /** Ack delivery: "startNow" means the backend was idle and it started its own turn. */
+  delivery?: string;
+  /** Backend queue item id, learned from turn.steerQueued. */
+  queueItemId?: string;
 }
 
 /**
@@ -1121,7 +1151,8 @@ export class ZcodeAcpServer {
         sessionCapabilities: { list: {}, resume: {}, fork: {} },
         // Read-only session file access lives on the bridge's loopback /fs
         // endpoint, hub-proxied at /api/instances/{id}/fs/* (ADR-0004).
-        _meta: { zcode: { fs: true } },
+        // `guide`: the `_zcode/guide` mid-turn steer (handlers/guide.ts).
+        _meta: { zcode: { fs: true, guide: true } },
       },
       // The GLM API key is read from ~/.zcode/v2/config.json by the ZCode
       // backend subprocess; the editor never needs to supply credentials.

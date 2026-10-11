@@ -37,6 +37,7 @@ import {
   setModel,
   setThoughtLevel,
 } from "./handlers/extensions.js";
+import { guide } from "./handlers/guide.js";
 import { echoUserPromptToOthers, sendAvailableCommandsDeferred } from "./handlers/io.js";
 import { loadEarlier } from "./handlers/replay.js";
 import { resendPendingInteractions } from "./handlers/server-requests.js";
@@ -242,6 +243,14 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
           ctx.client,
         );
       })
+      // Native guide-steer (non-standard; handlers/guide.ts): hand a mid-turn
+      // message to the running turn instead of preempting it with a second
+      // session/prompt. Advertised as agentCapabilities._meta.zcode.guide.
+      .onRequest(
+        "_zcode/guide",
+        z.object({ sessionId: z.string(), prompt: z.array(z.any()) }).passthrough(),
+        (ctx) => guide(server, ctx.params, ctx.client),
+      )
       .onRequest("session/set_config_option", (ctx) =>
         setConfigOptionHandler(server, ctx.params, server.clients.broadcast()),
       )

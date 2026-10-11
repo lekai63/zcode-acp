@@ -144,6 +144,15 @@ export class EventStreamListener {
   }
 
   /**
+   * Put a polled event back at the head of the stream. Lets a waiter that
+   * only scans for a boundary (the guide follow-up wait) hand the boundary
+   * event itself to the turn loop that owns it.
+   */
+  requeueFront(event: ZcodeEvent): void {
+    this.queue.unshift(event);
+  }
+
+  /**
    * Wait for the next event, resolving once one arrives or `timeoutMs` elapses
    * (resolves null on timeout). Events arriving with no active waiter are
    * queued. A timed-out waiter is marked `done` so a later event skips it

@@ -96,6 +96,7 @@ import {
   handleSandboxDenial,
   READ_ONLY_TOOLS,
 } from "./sandbox-allow.js";
+import { awaitGuideFollowUp, discardOpenGuides, hasOpenGuides, noteGuideEvent } from "./guide.js";
 import { handleServerRequests } from "./server-requests.js";
 
 /** Workspace descriptor used in session create/resume calls. */
@@ -1639,6 +1640,10 @@ export async function runOneTurn(
       }
 
       const chunkMsgId = randomUUID();
+      // A (re)send owns no live backend turn until its turn.started: refuse
+      // guides through the retry backoff and the send window (runEventTurn
+      // re-opens them).
+      turn.guideReady = false;
 
       // Drain gate: a recent cancel/preempt means the backend side needs
       // settling before the send — see drainBackendAfterCancel. EXEMPT while a
@@ -1854,7 +1859,7 @@ export async function runOneTurn(
         const gateArmed =
           preempted ||
           Date.now() - (server.lastCancelledAt.get(zcodeSid) ?? 0) < CANCEL_RESIDUE_WINDOW_MS;
-        const result = await runEventTurn(
+        let result = await runEventTurn(
           server,
           listener,
           monitor,
@@ -1865,6 +1870,41 @@ export async function runOneTurn(
           turn,
           gateArmed,
         );
+        // Native guide-steer (handlers/guide.ts): the turn ended with a guide
+        // still queued on the backend — keep this prompt open and run the
+        // turn that carries it as a follow-up round, so the client's steered
+        // message gets its reply inside the same prompt.
+        while (result.stopReason === "end_turn" && hasOpenGuides(turn)) {
+          const next = await awaitGuideFollowUp(server, { turn, listener, zcodeSid, acpSid, cx });
+          if (next.kind === "cancelled") {
+            result = { stopReason: "cancelled" };
+            break;
+          }
+          if (next.kind === "none") break;
+          try {
+            result = await runEventTurn(
+              server,
+              listener,
+              monitor,
+              differ,
+              cx,
+              acpSid,
+              randomUUID(),
+              turn,
+              true,
+              { staleTerminalBroadcast: next.staleTerminal },
+            );
+          } catch (e) {
+            // The prompt's own reply already completed: a failed guide turn
+            // must not re-send the ORIGINAL prompt through the retry loop
+            // below. Report it and keep the session usable.
+            if (!(e instanceof TurnFailedError) || turn.cancelled) throw e;
+            const errMsg = formatTurnError(e.turnError) || "turn failed";
+            await sendTextChunk(cx, acpSid, messages().requestFailed(errMsg), randomUUID());
+            result = { stopReason: "end_turn" };
+          }
+        }
+        turn.guideClosed = true;
 
         // Auto-compact: if context usage exceeds the threshold, compact before
         // the NEXT prompt needs the room. Configured via
@@ -1974,8 +2014,12 @@ export async function runOneTurn(
     await sendTextChunk(cx, acpSid, messages().requestFailed(errMsg), randomUUID());
     return { stopReason: "end_turn" };
   } finally {
+    turn.guideClosed = true;
+    turn.guideReady = false;
     backend.unregisterEventListener(zcodeSid, listener);
     server.pendingTurns.delete(requestId);
+    // Guides that never reached the model (cancel, failure) leave the queue.
+    if (hasOpenGuides(turn)) void discardOpenGuides(server, turn, zcodeSid);
     // Turn end = session activity — refresh the discovery summary and mark the
     // session discoverable regardless of outcome (end_turn, cancelled, retries
     // exhausted). Also refresh the backend-loaded verification: the resident
@@ -3414,9 +3458,11 @@ export async function runEventTurn(
   chunkMsgId: string,
   turn: PendingTurn,
   gateArmed: boolean,
+  opts: { staleTerminalBroadcast?: boolean } = {},
 ): Promise<acp.PromptResponse> {
   const backend = await server.ensureBackend();
   const translator = new EventTranslator();
+  if (opts.staleTerminalBroadcast) translator.ignoreTerminalBroadcasts = 1;
   differ.resetTurn();
   const NO_PROGRESS_MS = 120_000;
   // Stall termination policy. Two candidate liveness signals were verified
@@ -3823,6 +3869,10 @@ export async function runEventTurn(
     }
 
     recordProtocolProgress();
+    // Native guide-steer bookkeeping (handlers/guide.ts) runs ahead of the
+    // swallow guard and the attribution gate below: a guide's steer events
+    // are expected, whatever phase this turn is in.
+    if (noteGuideEvent(turn, ev)) continue;
     // Steer-swallow guard: a send accepted while the previous turn is still
     // generating is queued as steer input, which the backend silently DROPS
     // when that turn ends — no new turn ever starts (no turn.started), and
@@ -3870,6 +3920,8 @@ export async function runEventTurn(
     // observed on the same iteration that processes it.
     if (turnStartedAt === null && translator.turnStarted) {
       turnStartedAt = Date.now();
+      // Our backend turn is live: from here on a guide can ride on it.
+      if (!turn.guideClosed) turn.guideReady = true;
     }
     for (const iev of internalEvents) {
       if (iev.kind === "TextDelta" || iev.kind === "ReasoningDelta") emittedText = true;

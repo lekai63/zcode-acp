@@ -119,6 +119,8 @@ export interface Messages {
   thinkingPlaceholder: string;
   /** Steered prompt silently swallowed by the still-running turn. */
   messageSwallowedByTurn: string;
+  /** A native guide (`_zcode/guide`) was accepted but never reached the model. */
+  guideNotDelivered: string;
   interactionInterrupted: string;
   /** ExitPlanMode permission popup. */
   planApproveOption: string;
@@ -283,6 +285,7 @@ const zh: Messages = {
     `[子代理完成] ${ended} 个结束${failed ? ` · ${failed} 失败` : ""}${cancelled ? ` · ${cancelled} 取消` : ""}`,
   thinkingPlaceholder: "正在思考…",
   messageSwallowedByTurn: "[消息被并入仍在生成的回合，将被丢弃，请重新发送]",
+  guideNotDelivered: "[引导消息未能送达模型，请重新发送]",
   interactionInterrupted: "交互中断：连接关闭或超时，请重新发起对话。",
   planApproveOption: "同意——退出计划模式",
   planRejectOption: "拒绝——继续规划",
@@ -428,6 +431,7 @@ const en: Messages = {
   thinkingPlaceholder: "Thinking…",
   messageSwallowedByTurn:
     "[The message was merged into a still-generating turn and will be dropped; please resend it.]",
+  guideNotDelivered: "[The guidance message never reached the model; please resend it.]",
   interactionInterrupted:
     "Interaction interrupted: the connection closed or timed out; please start the request again.",
   planApproveOption: "Approve — exit plan mode",

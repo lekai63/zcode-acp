@@ -88,9 +88,9 @@ export type ZcodeEventType =
   // settings change (model/mode/thoughtLevel switch, incl. mid-turn). The bridge
   // wraps it as a ZcodeEvent so it flows through the same listener pipeline.
   | "state.updated"
-  // app-server 0.15.2+: steer lifecycle + terminal turn. Not yet translated by
-  // the bridge; tracked in docs/BACKLOG.md. Listed here so unknown-type guards
-  // stay accurate.
+  // app-server 0.15.2+: steer lifecycle + terminal turn. The steer pair is read
+  // for the bridge's own guides (handlers/guide.ts), never translated to ACP;
+  // turn.terminal is tracked in docs/BACKLOG.md.
   | "turn.steerQueued"
   | "turn.steerDrained"
   | "turn.terminal"

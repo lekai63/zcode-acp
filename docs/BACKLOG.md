@@ -225,7 +225,9 @@ Topic model (`transport.ts:83-161`): subscribe with
 toSeq]` deltas — the watermark/CAS vocabulary row-targeting commands require
 (`baseRevision` + `baseLogEpoch`, `command.ts:293-317`).
 
-The bridge already speaks `v4/command` (the dual stop), and since 2026-09-24
+The bridge already speaks `v4/command` (the dual stop; since 2026-10-10 also
+`sendText requestedDelivery:"guide"` + `setAutoDrain`/`deleteQueueItem` for
+`_zcode/guide`, see PROTOCOL.md), and since 2026-09-24
 also `startSavedWorkflow` / `resumeWorkflowRun` (Settings API launch routes,
 ADR-0029 — the ack is terminal, awaited via `request()`) plus the seven
 `v4/conversation/workflowRun*` read queries (run progress poller + run-detail

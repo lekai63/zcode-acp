@@ -459,21 +459,34 @@ Session state update (usage, etc.).
 ### Steer lifecycle events
 
 When a user input is steered into (queued behind) a running turn, the backend
-emits a pair of lifecycle events (app-server 0.15.2+). The bridge does
-not currently translate these — they are tracked as a future enhancement (see
-[`BACKLOG.md`](./BACKLOG.md)).
+emits a pair of lifecycle events (app-server 0.15.2+). The bridge reads them
+for its own guides (`_zcode/guide`, below) — `inputId`/`queryId` is the v4
+`commandId`, `intent.queueItemId` (else `pendingInputId`) the queue item — and
+does not translate them into ACP updates.
 
 ```json
 {
   "type": "turn.steerQueued",
-  "payload": {}
+  "payload": {
+    "pendingInputId": "queue_<commandId>",
+    "inputId": "<commandId>",
+    "queryId": "<commandId>",
+    "delivery": "guide",
+    "targetTurnId": "turn_…",
+    "queueLength": 1
+  }
 }
 ```
 
 ```json
 {
   "type": "turn.steerDrained",
-  "payload": {}
+  "payload": {
+    "pendingInputIds": ["queue_<commandId>"],
+    "queryIds": ["<commandId>"],
+    "targetTurnId": "turn_…",
+    "injectedMessageIds": ["msg_…"]
+  }
 }
 ```
 
@@ -770,7 +783,45 @@ it from its RPC dispatch (verified against 0.16.3: `-32601 Method not found`);
 steering moved to the v4 command/conversation API. The bridge's
 `session/steer` ACP extension and the `/steer` slash command were removed
 accordingly. Queued inputs still surface as `turn.steerQueued` /
-`turn.steerDrained` events (see above).
+`turn.steerDrained` events (see above); the v4 replacement is wired as
+`_zcode/guide`.
+
+### `_zcode/guide` — mid-turn guide (ACP extension, bridge-side)
+
+Advertised as `agentCapabilities._meta.zcode.guide: true` in the `initialize`
+response. Hands a text message to the RUNNING turn of a session instead of
+preempting it with a second `session/prompt` — ZCode's own "guide" follow-up
+(Desktop's follow-up mode `guide`).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "_zcode/guide",
+  "params": { "sessionId": "<acp session>", "prompt": [{ "type": "text", "text": "also check X" }] }
+}
+```
+
+Result: `{"outcome":"guided","inputId":"<commandId>","delivery":"queue"|"startNow"}`,
+or `{"outcome":"unavailable","reason":"…"}` — the client then falls back to a
+regular prompt. Unavailable when the session has no live prompt turn
+(`no_active_turn`: none running, its backend turn not started yet, a retry in
+backoff, already returning, or a goal-loop round), for non-text content
+(`unsupported_content`), slash commands (`slash_command`), and backend
+rejections (`rejected: <reasonCode>`).
+
+Backend side it is a `v4/command` `sendText {text, requestedDelivery:"guide",
+heldQueueDisposition:"keepQueueAndSend"}`. On a steerable turn the input is
+queued on that turn and injected as a user message at the next model-step
+boundary (after a tool batch, or after a text-only step, which then keeps the
+turn going). The ACP prompt that owns the turn does not resolve until every
+guide reached the model: if the turn ends with one still queued (a tool
+stopped the turn, the turn was no longer steerable), the bridge resumes the
+session queue (`setAutoDrain {autoDrain:true}`, CAS on `baseRevision`) and
+streams the turn that carries it as part of the same prompt — ZCode drains its
+queue only after v4-started turns, never after a `session/send` one. A guide
+that never reaches the model is removed again (`deleteQueueItem`) when the
+prompt is cancelled, and reported to the user after 45s without a turn.
 
 ### `session/setMode`
 

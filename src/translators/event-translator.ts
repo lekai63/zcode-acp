@@ -88,6 +88,13 @@ export class EventTranslator {
   sawPromptCompleted = false;
   sawPromptFailed = false;
   /**
+   * Terminal broadcasts still owed by the PREVIOUS turn, to be skipped. Set
+   * for a guide follow-up round (handlers/guide.ts) whose turn started before
+   * the finished turn's own `prompt_completed` arrived — reading that one as
+   * ours would end the guide turn at its first quiet stretch.
+   */
+  ignoreTerminalBroadcasts = 0;
+  /**
    * True while inside a background-task notification turn
    * (`turn.started {inputSource:"background_task"}`). Set on its turn.started,
    * cleared on the next user-initiated turn.started. While true, `translate`
@@ -249,9 +256,14 @@ export class EventTranslator {
       ) {
         // Authoritative terminal broadcast for OUR turn (see the field
         // docstrings for why this is not a primary terminal).
-        if (reason === "prompt_failed") this.sawPromptFailed = true;
-        else this.sawPromptCompleted = true;
-        log(`  [event] state.updated (${reason}) → terminal broadcast recorded`);
+        if (this.ignoreTerminalBroadcasts > 0) {
+          this.ignoreTerminalBroadcasts--;
+          log(`  [event] state.updated (${reason}) → previous turn's broadcast, ignored`);
+        } else {
+          if (reason === "prompt_failed") this.sawPromptFailed = true;
+          else this.sawPromptCompleted = true;
+          log(`  [event] state.updated (${reason}) → terminal broadcast recorded`);
+        }
       }
       results.push(...this.translateStateUpdated(payload));
     }

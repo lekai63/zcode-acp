@@ -272,6 +272,23 @@ ZCode protocol types into ACP notifications directly — always translate.
   prompt's turn-attribution gate (armed on a recent cancel) drops the abandoned
   turn's leftover stream. Never "wait for the backend terminal event" after a
   cancel — that made ESC feel dead for the whole remaining generation.
+- **Native guide-steer (`_zcode/guide`, handlers/guide.ts) must not let the
+  prompt resolve while a guide is open, and must resume the queue itself.**
+  A guide is v4 `sendText requestedDelivery:"guide"`; ZCode injects it at the
+  next model-step boundary (`turn.steerDrained`) or, when the turn can no
+  longer take it (a tool stopped the turn, not steerable), demotes it to the
+  session queue. ZCode drains that queue only after v4-STARTED turns
+  (`afterLegacyStateMutation` → `autoDrainV4QueueIfReady`, v4-bridge.ts); a
+  `session/send` turn ends in `afterStateMutation`, which never drains
+  (server-operations.ts) — so the bridge's follow-up wait resumes the queue
+  with `setAutoDrain {autoDrain:true}` (CAS on `baseRevision`; a `stale` ack
+  carries the fresh revision) and streams the guide's turn
+  (`turn.started.inputId` = the guide's commandId) inside the same ACP
+  prompt. Verified live 2026-10-10 (inline at a tool boundary, inline at a
+  text-only step, demoted by a rejected ExitPlanMode → follow-up turn). A cancel can land after the stop
+  already drained the guide into history (the stop ends the tool batch — a
+  boundary): the cleanup's `deleteQueueItem` then answers `noop`, which is
+  expected.
 - **`session/prompt` ordering**: subscribe to events BEFORE calling `session/send`
   — short turns can complete before a late subscribe catches them.
 - **Auto-compact runs DETACHED from the turn that armed it — do not re-couple
