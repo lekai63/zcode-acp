@@ -10,7 +10,7 @@
  * reflects the new state.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 
 import type { ZcodeReadResult } from "../backend/types.js";
@@ -26,6 +26,7 @@ import {
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { configProviderIdFor } from "./account-provider.js";
+import { builtinProviderTablePath, listProviderTemplates } from "../settings/provider-config.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 
 interface ProviderModelsJson {
@@ -77,11 +78,14 @@ interface PersonalModelRule {
 
 interface PersonalProviderRule {
   providerId?: string;
+  /** Created from a bundled template: its endpoint and models come from the template. */
+  templateId?: string;
   providerName?: string;
   enabled?: boolean;
   config?: {
     access?: { type?: string; apiKey?: string };
     api?: { type?: string; baseUrl?: string };
+    personalModelIds?: string[];
   };
 }
 
@@ -107,6 +111,45 @@ interface PersonalModels {
   providers: Array<{ pid: string; rule: PersonalProviderRule }>;
 }
 
+/**
+ * Bundled templates by id (model ids + base URL), cached per table file.
+ *
+ * The app's "add provider" writes a rule that only REFERENCES its template
+ * (`templateId`): endpoint and model list live in the bundled table and are
+ * resolved at read time, so the rule itself carries no `api` and no model
+ * ids. Without this lookup such a provider reaches the backend registry fine
+ * but never the dropdown.
+ */
+let templateTablePath: string | null | undefined;
+let templateCache: {
+  key: string;
+  byId: Map<string, { modelIds: string[]; baseUrl?: string }>;
+} | null = null;
+function templateById(
+  templateId: string | undefined,
+): { modelIds: string[]; baseUrl?: string } | undefined {
+  if (!templateId) return undefined;
+  try {
+    templateTablePath ??= builtinProviderTablePath();
+    if (!templateTablePath) return undefined;
+    const key = `${templateTablePath}:${statSync(templateTablePath).mtimeMs}`;
+    if (templateCache?.key !== key) {
+      templateCache = {
+        key,
+        byId: new Map(
+          listProviderTemplates(templateTablePath).map((t) => [
+            t.templateId,
+            { modelIds: t.modelIds, ...(t.baseUrl ? { baseUrl: t.baseUrl } : {}) },
+          ]),
+        ),
+      };
+    }
+    return templateCache.byId.get(templateId);
+  } catch {
+    return undefined; // no readable table — the rule's own fields decide
+  }
+}
+
 function readPersonalProviderConfig(): PersonalProviderConfig | null {
   try {
     return JSON.parse(readFileSync(zcodePersonalProviderPath(), "utf8")) as PersonalProviderConfig;
@@ -129,9 +172,13 @@ function loadPersonalModels(): PersonalModels | null {
     reasoningByModel: new Map(),
     providers: [],
   };
+  const disabled = new Set<string>();
   for (const rule of modelRules) {
     if (!rule.providerId || !rule.modelId) continue;
-    if (rule.config?.enabled === false) continue;
+    if (rule.config?.enabled === false) {
+      disabled.add(`${configProviderIdFor(rule.providerId)}\\${rule.modelId}`);
+      continue;
+    }
     const pid = configProviderIdFor(rule.providerId);
     const ids = out.modelsByProvider.get(pid) ?? [];
     if (!ids.includes(rule.modelId)) ids.push(rule.modelId);
@@ -144,7 +191,20 @@ function loadPersonalModels(): PersonalModels | null {
   }
   for (const rule of providerRules) {
     if (!rule.providerId) continue;
-    out.providers.push({ pid: configProviderIdFor(rule.providerId), rule });
+    const pid = configProviderIdFor(rule.providerId);
+    out.providers.push({ pid, rule });
+    // The app's effective membership: the template's models, then the rule's
+    // own additions; a model switched off by a model rule stays off.
+    const members = [
+      ...(templateById(rule.templateId)?.modelIds ?? []),
+      ...(rule.config?.personalModelIds ?? []),
+    ];
+    if (members.length === 0) continue;
+    const ids = out.modelsByProvider.get(pid) ?? [];
+    for (const modelId of members) {
+      if (!ids.includes(modelId) && !disabled.has(`${pid}\\${modelId}`)) ids.push(modelId);
+    }
+    out.modelsByProvider.set(pid, ids);
   }
   return out;
 }
@@ -252,7 +312,7 @@ function appendPersonalOnlyProviders(
       enabled: rule.enabled,
       options: {
         apiKey: rule.config?.access?.apiKey,
-        baseURL: rule.config?.api?.baseUrl,
+        baseURL: rule.config?.api?.baseUrl ?? templateById(rule.templateId)?.baseUrl,
       },
     };
     if (!providerSelectable(pid, synthesized)) continue;
