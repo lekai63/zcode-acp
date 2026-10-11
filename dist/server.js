@@ -980,7 +980,8 @@ export class ZcodeAcpServer {
                 sessionCapabilities: { list: {}, resume: {}, fork: {} },
                 // Read-only session file access lives on the bridge's loopback /fs
                 // endpoint, hub-proxied at /api/instances/{id}/fs/* (ADR-0004).
-                _meta: { zcode: { fs: true } },
+                // `guide`: the `_zcode/guide` mid-turn steer (handlers/guide.ts).
+                _meta: { zcode: { fs: true, guide: true } },
             },
             // The GLM API key is read from ~/.zcode/v2/config.json by the ZCode
             // backend subprocess; the editor never needs to supply credentials.

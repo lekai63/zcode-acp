@@ -63,6 +63,8 @@ export interface Messages {
     thinkingPlaceholder: string;
     /** Steered prompt silently swallowed by the still-running turn. */
     messageSwallowedByTurn: string;
+    /** A native guide (`_zcode/guide`) was accepted but never reached the model. */
+    guideNotDelivered: string;
     interactionInterrupted: string;
     /** ExitPlanMode permission popup. */
     planApproveOption: string;

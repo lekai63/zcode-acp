@@ -401,7 +401,9 @@ export declare function turnResult(translator: EventTranslator, stopReason: acp.
  * handling (requestPermission / ExitPlanMode / AskUserQuestion) lands in
  * Commit 6 — for now they're polled to keep the inbox clear.
  */
-export declare function runEventTurn(server: ZcodeAcpServer, listener: EventStreamListener, monitor: TurnMonitor, differ: ProjectionDiffer, cx: acp.AgentContext, acpSid: string, chunkMsgId: string, turn: PendingTurn, gateArmed: boolean): Promise<acp.PromptResponse>;
+export declare function runEventTurn(server: ZcodeAcpServer, listener: EventStreamListener, monitor: TurnMonitor, differ: ProjectionDiffer, cx: acp.AgentContext, acpSid: string, chunkMsgId: string, turn: PendingTurn, gateArmed: boolean, opts?: {
+    staleTerminalBroadcast?: boolean;
+}): Promise<acp.PromptResponse>;
 /**
  * Turn-attribution gate decision (pure, exported for tests): whether an event
  * observed before this turn's own `turn.started` should be dropped as leftover

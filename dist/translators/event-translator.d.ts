@@ -65,6 +65,13 @@ export declare class EventTranslator {
     sawPromptCompleted: boolean;
     sawPromptFailed: boolean;
     /**
+     * Terminal broadcasts still owed by the PREVIOUS turn, to be skipped. Set
+     * for a guide follow-up round (handlers/guide.ts) whose turn started before
+     * the finished turn's own `prompt_completed` arrived — reading that one as
+     * ours would end the guide turn at its first quiet stretch.
+     */
+    ignoreTerminalBroadcasts: number;
+    /**
      * True while inside a background-task notification turn
      * (`turn.started {inputSource:"background_task"}`). Set on its turn.started,
      * cleared on the next user-initiated turn.started. While true, `translate`
