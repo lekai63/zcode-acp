@@ -9,25 +9,31 @@
  *
  * What this module deliberately does NOT do:
  *
- *  - **Create or delete providers.** A provider rule carries credentials, an
+ *  - **Create free-form providers.** A provider rule carries credentials, an
  *    API protocol type and a model list, and getting it wrong yields a provider
- *    that fails at request time. That is a desktop-app (or hand-edit) job.
+ *    that fails at request time. Providers are only ever created FROM A
+ *    TEMPLATE of the bundled table (`createProviderFromTemplate`), the way the
+ *    desktop app's "add provider" does it (packages/provider/src/config-service.ts
+ *    `createPersonalProvider`): the rule references the template, so endpoint,
+ *    API type and model list stay the app's own; only the key is user input.
  *  - **Write `account:*` access.** The registry rejects `zhipu-account` access
  *    on personal rules outright — those providers come from the bundled table
  *    plus the account snapshot the bridge pushes. Writing one produces a file
  *    the backend refuses to load.
  *
  * Everything else the app's model page can do is here: enable/disable, rename,
- * add/remove a model on an existing provider, and edit a model's context
- * window and reasoning-level vocabulary.
+ * replace a key, delete a personal provider, add/remove a model on an existing
+ * provider, and edit a model's context window and reasoning-level vocabulary.
  *
  * Canonical form matters: the file is written with 2-space indentation and NO
  * trailing newline, matching the app's own writer. A non-canonical file is
  * read fine but rewritten by the app on its next save, which would look like
  * our edit "reverting".
  */
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { readJsonDocument, writeJsonAtomic } from "./atomic-write.js";
+import { BUILTIN_PROVIDER_ENV, builtinProviderEnv } from "../backend/resolve.js";
 import { zcodePersonalProviderPath } from "../utils.js";
 /** The only schema version the file format accepts. */
 const SCHEMA_VERSION = 1;
@@ -307,5 +313,175 @@ export async function readProviderConfigRaw() {
 /** The canonical bytes a document would be written as. */
 export function canonicalBytes(doc) {
     return encodeProviderConfig(doc);
+}
+/**
+ * The bundled provider table the CLI is launched with: the same file
+ * `builtinProviderEnv` injects (next to the resolved CLI entry), else an
+ * inherited `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`.
+ */
+export function builtinProviderTablePath() {
+    return builtinProviderEnv()[BUILTIN_PROVIDER_ENV] ?? process.env[BUILTIN_PROVIDER_ENV] ?? null;
+}
+function readBuiltinTable(tablePath) {
+    if (!tablePath)
+        throw new Error("the bundled provider table (zcode-builtin.json) was not found");
+    return JSON.parse(readFileSync(tablePath, "utf8"));
+}
+/** Templates of the bundled table, in table order. */
+export function listProviderTemplates(tablePath = builtinProviderTablePath()) {
+    const rules = readBuiltinTable(tablePath).config?.providerConfigRules?.templateRules ?? [];
+    const out = [];
+    for (const rule of rules) {
+        const templateId = rule.templateId?.trim();
+        const accessType = rule.config?.access?.type;
+        if (!templateId)
+            continue;
+        if (accessType !== "api-key" && accessType !== "zhipu-coding-plan-api-key")
+            continue;
+        const names = rule.templateNameMap ?? {};
+        out.push({
+            templateId,
+            name: names["en-US"] ?? names["zh-CN"] ?? templateId,
+            ...(names["zh-CN"] ? { nameZh: names["zh-CN"] } : {}),
+            accessType,
+            ...(rule.config?.access?.apiKeyManagementUrl
+                ? { apiKeyManagementUrl: rule.config.access.apiKeyManagementUrl }
+                : {}),
+            ...(rule.config?.api?.type ? { apiType: rule.config.api.type } : {}),
+            ...(rule.config?.api?.baseUrl ? { baseUrl: rule.config.api.baseUrl } : {}),
+            modelIds: [...(rule.config?.builtinModelIds ?? [])],
+        });
+    }
+    return out;
+}
+/** The app's id seed: lower-case, non-alphanumerics folded to `-` (`nextPersonalProviderId`). */
+function providerIdSeed(value) {
+    return (value
+        .trim()
+        .toLocaleLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "") || "new-provider");
+}
+function nextFree(base, taken, join) {
+    if (!taken(base))
+        return base;
+    for (let suffix = 2;; suffix += 1) {
+        const candidate = `${base}${join}${suffix}`;
+        if (!taken(candidate))
+            return candidate;
+    }
+}
+/**
+ * Create a personal provider from a bundled template, as the desktop app's
+ * "add provider" does: id `<template-seed>` (then `-2`, `-3`, …) clear of
+ * every bundled and personal id, the template's display name de-duplicated
+ * with ` 2`, ` 3`, …, group `standard-personal`, empty personal model lists,
+ * appended to `providerOrder`.
+ *
+ * The key is stored with the TEMPLATE's access type: the personal overlay's
+ * `access.type` replaces the template's (`ApiKeyAccessConfig.overlay`), so a
+ * Coding Plan template saved as plain `api-key` would silently become a
+ * pay-as-you-go provider.
+ */
+export async function createProviderFromTemplate(input, tablePath = builtinProviderTablePath()) {
+    const table = readBuiltinTable(tablePath);
+    const template = listProviderTemplates(tablePath).find((t) => t.templateId === input.templateId);
+    if (!template)
+        throw new Error(`provider template ${input.templateId} does not exist`);
+    const apiKey = input.apiKey.trim();
+    if (!apiKey)
+        throw new Error("an API key is required");
+    const builtinIds = (table.config?.providerConfigRules?.providerRules ?? [])
+        .map((r) => r.providerId)
+        .filter((id) => Boolean(id));
+    const builtinNames = (table.config?.providerConfigRules?.providerRules ?? [])
+        .map((r) => r.providerName?.trim().toLocaleLowerCase())
+        .filter((name) => Boolean(name));
+    let providerId = "";
+    const doc = await saveProviderConfig((current) => {
+        const rules = current.config.providerConfigRules.providerRules;
+        const occupied = new Set([...builtinIds, ...rules.map((r) => r.providerId)]);
+        providerId = nextFree(providerIdSeed(template.templateId), (c) => occupied.has(c), "-");
+        const labels = new Set([
+            ...builtinNames,
+            ...rules.map((r) => r.providerName?.trim().toLocaleLowerCase()).filter(Boolean),
+        ]);
+        const seed = input.providerName?.trim() || template.name;
+        const providerName = nextFree(seed, (c) => labels.has(c.toLocaleLowerCase()), " ");
+        rules.push({
+            providerId,
+            templateId: template.templateId,
+            providerName,
+            config: {
+                group: "standard-personal",
+                access: { type: template.accessType, apiKey },
+                personalModelIds: [],
+                modelOrder: [],
+            },
+        });
+        current.config.providerOrder = personalProviderOrder(current, providerId);
+    });
+    return { providerId, doc };
+}
+/** `providerOrder` with `added` last: kept order first, then unlisted personal providers. */
+function personalProviderOrder(doc, added) {
+    const personal = doc.config.providerConfigRules.providerRules
+        .filter((r) => (r.config?.group ?? "standard-personal") === "standard-personal")
+        .map((r) => r.providerId);
+    const kept = (doc.config.providerOrder ?? []).filter((id) => personal.includes(id) && id !== added);
+    const rest = personal.filter((id) => !kept.includes(id) && id !== added);
+    return [...kept, ...rest, added];
+}
+/**
+ * Delete a personal provider with its model rules and order entry, as the
+ * app's `deletePersonalProvider` does. Bundled and account providers have no
+ * rule here and cannot be deleted.
+ */
+export async function deleteProvider(providerId) {
+    assertNotAccountProvider(providerId);
+    let missing = false;
+    const doc = await saveProviderConfig((current) => {
+        const rules = current.config.providerConfigRules.providerRules;
+        const index = rules.findIndex((r) => r.providerId === providerId);
+        if (index < 0) {
+            missing = true;
+            return;
+        }
+        rules.splice(index, 1);
+        const models = current.config.modelConfigRules;
+        models.providerModelRules = models.providerModelRules.filter((r) => r.providerId !== providerId);
+        models.manualProviderModelRules = models.manualProviderModelRules.filter((r) => r.providerId !== providerId);
+        if (current.config.providerOrder) {
+            current.config.providerOrder = current.config.providerOrder.filter((id) => id !== providerId);
+        }
+    });
+    if (missing)
+        throw new Error(`provider ${providerId} has no rule in provider_config.json`);
+    return doc;
+}
+/**
+ * Replace a personal provider's key, keeping its access type (the rule's own,
+ * else its template's, else `api-key`).
+ */
+export async function setProviderApiKey(providerId, apiKey, tablePath = builtinProviderTablePath()) {
+    assertNotAccountProvider(providerId);
+    const key = apiKey.trim();
+    if (!key)
+        throw new Error("an API key is required");
+    let templateType;
+    return saveProviderConfig((current) => {
+        const rule = current.config.providerConfigRules.providerRules.find((r) => r.providerId === providerId);
+        if (!rule) {
+            throw new Error(`provider ${providerId} has no rule in provider_config.json`);
+        }
+        if (rule.templateId && !rule.config?.access?.type) {
+            templateType ??= listProviderTemplates(tablePath).find((t) => t.templateId === rule.templateId)?.accessType;
+        }
+        const type = rule.config?.access?.type ?? templateType ?? "api-key";
+        rule.config = {
+            ...(rule.config ?? {}),
+            access: { ...(rule.config?.access ?? {}), type, apiKey: key },
+        };
+    });
 }
 //# sourceMappingURL=provider-config.js.map

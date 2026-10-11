@@ -9,17 +9,21 @@
  *
  * What this module deliberately does NOT do:
  *
- *  - **Create or delete providers.** A provider rule carries credentials, an
+ *  - **Create free-form providers.** A provider rule carries credentials, an
  *    API protocol type and a model list, and getting it wrong yields a provider
- *    that fails at request time. That is a desktop-app (or hand-edit) job.
+ *    that fails at request time. Providers are only ever created FROM A
+ *    TEMPLATE of the bundled table (`createProviderFromTemplate`), the way the
+ *    desktop app's "add provider" does it (packages/provider/src/config-service.ts
+ *    `createPersonalProvider`): the rule references the template, so endpoint,
+ *    API type and model list stay the app's own; only the key is user input.
  *  - **Write `account:*` access.** The registry rejects `zhipu-account` access
  *    on personal rules outright — those providers come from the bundled table
  *    plus the account snapshot the bridge pushes. Writing one produces a file
  *    the backend refuses to load.
  *
  * Everything else the app's model page can do is here: enable/disable, rename,
- * add/remove a model on an existing provider, and edit a model's context
- * window and reasoning-level vocabulary.
+ * replace a key, delete a personal provider, add/remove a model on an existing
+ * provider, and edit a model's context window and reasoning-level vocabulary.
  *
  * Canonical form matters: the file is written with 2-space indentation and NO
  * trailing newline, matching the app's own writer. A non-canonical file is
@@ -45,6 +49,8 @@ export interface ModelRule {
 }
 export interface ProviderRule {
     providerId: string;
+    /** Set on providers created from a bundled template; endpoint and models come from it. */
+    templateId?: string;
     providerName?: string;
     enabled?: boolean;
     config?: {
@@ -120,4 +126,55 @@ export declare function removeModel(providerId: string, modelId: string): Promis
 export declare function readProviderConfigRaw(): Promise<string | null>;
 /** The canonical bytes a document would be written as. */
 export declare function canonicalBytes(doc: ProviderConfigFile): string;
+/** A provider template of the bundled table (`zcode-builtin.json` `templateRules`). */
+export interface ProviderTemplate {
+    templateId: string;
+    /** en-US name, falling back to zh-CN, then the id. */
+    name: string;
+    nameZh?: string;
+    accessType: "api-key" | "zhipu-coding-plan-api-key";
+    apiKeyManagementUrl?: string;
+    apiType?: string;
+    baseUrl?: string;
+    modelIds: string[];
+}
+/**
+ * The bundled provider table the CLI is launched with: the same file
+ * `builtinProviderEnv` injects (next to the resolved CLI entry), else an
+ * inherited `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`.
+ */
+export declare function builtinProviderTablePath(): string | null;
+/** Templates of the bundled table, in table order. */
+export declare function listProviderTemplates(tablePath?: string | null): ProviderTemplate[];
+/**
+ * Create a personal provider from a bundled template, as the desktop app's
+ * "add provider" does: id `<template-seed>` (then `-2`, `-3`, …) clear of
+ * every bundled and personal id, the template's display name de-duplicated
+ * with ` 2`, ` 3`, …, group `standard-personal`, empty personal model lists,
+ * appended to `providerOrder`.
+ *
+ * The key is stored with the TEMPLATE's access type: the personal overlay's
+ * `access.type` replaces the template's (`ApiKeyAccessConfig.overlay`), so a
+ * Coding Plan template saved as plain `api-key` would silently become a
+ * pay-as-you-go provider.
+ */
+export declare function createProviderFromTemplate(input: {
+    templateId: string;
+    apiKey: string;
+    providerName?: string;
+}, tablePath?: string | null): Promise<{
+    providerId: string;
+    doc: ProviderConfigFile;
+}>;
+/**
+ * Delete a personal provider with its model rules and order entry, as the
+ * app's `deletePersonalProvider` does. Bundled and account providers have no
+ * rule here and cannot be deleted.
+ */
+export declare function deleteProvider(providerId: string): Promise<ProviderConfigFile>;
+/**
+ * Replace a personal provider's key, keeping its access type (the rule's own,
+ * else its template's, else `api-key`).
+ */
+export declare function setProviderApiKey(providerId: string, apiKey: string, tablePath?: string | null): Promise<ProviderConfigFile>;
 //# sourceMappingURL=provider-config.d.ts.map
