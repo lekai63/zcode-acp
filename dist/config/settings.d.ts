@@ -13,7 +13,8 @@ export declare function autoCompactThreshold(env?: NodeJS.ProcessEnv): number;
 export declare function goalMaxTurns(env?: NodeJS.ProcessEnv): number;
 /** Escape hatch routing /goal through the legacy backend goal mode. */
 export declare function goalModeIsBackend(env?: NodeJS.ProcessEnv): boolean;
-/** Mode a newly created session starts in (default "yolo"). */
+/** Mode a newly created session starts in (default "yolo"). An env value
+ *  outside SESSION_MODES (e.g. the unimplemented `auto`) falls back too. */
 export declare function initialSessionMode(env?: NodeJS.ProcessEnv): string;
 /**
  * Wait cap (ms) for permission/elicitation requests; 0 = wait forever.

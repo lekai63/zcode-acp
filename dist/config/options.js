@@ -13,6 +13,7 @@ import { readFileSync, statSync } from "node:fs";
 import { recordModelChoice } from "../lazy-sessions.js";
 import { clientConnectionRoot, CONFIG_DISPATCH, CONFIG_META, log, warn, ZCODE_CREDS_PATH, zcodePersonalProviderPath, } from "../utils.js";
 import { configProviderIdFor } from "./account-provider.js";
+import { SESSION_MODES } from "./session-modes.js";
 import { builtinProviderTablePath, listProviderTemplates } from "../settings/provider-config.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 /** Read the config.json contents (UTF-8). Throws on read/parse failure. */
@@ -416,10 +417,9 @@ export async function buildModes(server, zcodeSid) {
     }
     return {
         currentModeId: currentMode,
-        // ZCode 3.3.0 mode enum: plan/build/edit/yolo/auto. settings.mode only
-        // carries `current` (no `available` list, unlike thoughtLevel), so the full
-        // enum is advertised here.
-        availableModes: ["plan", "build", "edit", "yolo", "auto"].map((m) => ({
+        // settings.mode only carries `current` (no `available` list, unlike
+        // thoughtLevel), so the bridge's own list is advertised here.
+        availableModes: SESSION_MODES.map((m) => ({
             id: m,
             name: capitalize(m),
         })),

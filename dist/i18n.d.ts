@@ -177,6 +177,7 @@ export interface Messages {
     slashErrSwitchFailed: (model: string) => string;
     slashErrArg: (cmd: string) => string;
     slashErrUnknown: (cmd: string) => string;
+    slashErrModeArg: (mode: string) => string;
     slashErrFailed: (cmd: string, msg: string) => string;
 }
 /** Current message table — resolved per call so env changes/tests apply live. */

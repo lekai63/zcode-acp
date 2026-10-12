@@ -7,6 +7,7 @@
  * per-field precedence is file value (when present AND valid) > env var >
  * built-in default. See src/config/user-config.ts for the file schema.
  */
+import { isSessionMode } from "./session-modes.js";
 import { loadUserConfig } from "./user-config.js";
 /** Auto-compact trigger: absolute token count; 0 = disabled. */
 export function autoCompactThreshold(env = process.env) {
@@ -31,12 +32,14 @@ export function goalModeIsBackend(env = process.env) {
         return file === "backend";
     return env.ZCODE_ACP_GOAL_MODE === "backend";
 }
-/** Mode a newly created session starts in (default "yolo"). */
+/** Mode a newly created session starts in (default "yolo"). An env value
+ *  outside SESSION_MODES (e.g. the unimplemented `auto`) falls back too. */
 export function initialSessionMode(env = process.env) {
     const file = loadUserConfig(env).session?.mode;
     if (file !== undefined)
         return file;
-    return env.ZCODE_ACP_MODE || "yolo";
+    const raw = env.ZCODE_ACP_MODE;
+    return isSessionMode(raw) ? raw : "yolo";
 }
 /**
  * Wait cap (ms) for permission/elicitation requests; 0 = wait forever.

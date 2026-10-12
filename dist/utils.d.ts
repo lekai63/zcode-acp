@@ -135,22 +135,10 @@ export declare const CONFIG_META: {
     readonly mode: {
         readonly name: "Mode";
         readonly category: "mode";
-        readonly options: readonly [{
-            readonly value: "plan";
-            readonly name: "plan";
-        }, {
-            readonly value: "build";
-            readonly name: "build";
-        }, {
-            readonly value: "edit";
-            readonly name: "edit";
-        }, {
-            readonly value: "yolo";
-            readonly name: "yolo";
-        }, {
-            readonly value: "auto";
-            readonly name: "auto";
-        }];
+        readonly options: {
+            value: "plan" | "build" | "edit" | "yolo";
+            name: "plan" | "build" | "edit" | "yolo";
+        }[];
     };
     readonly thought: {
         readonly name: "Thought Level";
