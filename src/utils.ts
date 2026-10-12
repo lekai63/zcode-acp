@@ -9,6 +9,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { appendDiary } from "./crash-guards.js";
+import { SESSION_MODES } from "./config/session-modes.js";
 import { debugEnabled } from "./config/settings.js";
 
 /** ACP protocol version this server speaks. */
@@ -170,13 +171,7 @@ export const CONFIG_META = {
   mode: {
     name: "Mode",
     category: "mode",
-    options: [
-      { value: "plan", name: "plan" },
-      { value: "build", name: "build" },
-      { value: "edit", name: "edit" },
-      { value: "yolo", name: "yolo" },
-      { value: "auto", name: "auto" },
-    ],
+    options: SESSION_MODES.map((m) => ({ value: m, name: m })),
   },
   thought: {
     name: "Thought Level",

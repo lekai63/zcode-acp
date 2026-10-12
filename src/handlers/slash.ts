@@ -52,6 +52,7 @@ import {
 } from "../config/mcp-discovery.js";
 import { loadPluginCommands } from "../config/plugin-commands.js";
 import { loadSkillCommands } from "../config/skill-discovery.js";
+import { isSessionMode } from "../config/session-modes.js";
 import { goalModeIsBackend } from "../config/settings.js";
 import { workflowGateNow } from "../config/workflow-gate.js";
 import { messages } from "../i18n.js";
@@ -566,6 +567,9 @@ export async function handleSlashCommand(
       case "mode":
       case "thought": {
         if (!arg) throw new RequestError(-32602, messages().slashErrArg(cmd));
+        if (cmd === "mode" && !isSessionMode(arg)) {
+          throw new RequestError(-32602, messages().slashErrModeArg(arg));
+        }
         const dispatch = CONFIG_DISPATCH[cmd];
         if (!dispatch) throw new RequestError(-32602, messages().slashErrUnknown(cmd));
         const resp = await (

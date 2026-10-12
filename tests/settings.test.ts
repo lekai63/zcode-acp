@@ -107,6 +107,12 @@ describe("initialSessionMode", () => {
     writeConfig({ session: { mode: "plan" } });
     expect(initialSessionMode(envOf({ ZCODE_ACP_MODE: "edit" }))).toBe("plan");
   });
+
+  it("the unimplemented auto mode is ignored from file and env", () => {
+    expect(initialSessionMode(envOf({ ZCODE_ACP_MODE: "auto" }))).toBe("yolo");
+    writeConfig({ session: { mode: "auto" } });
+    expect(initialSessionMode(envOf({ ZCODE_ACP_MODE: "edit" }))).toBe("edit");
+  });
 });
 
 describe("interactionTimeoutMs", () => {

@@ -21,6 +21,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
+import { SESSION_MODES } from "./config/session-modes.js";
 import { languageOverride } from "./config/settings.js";
 import { zcodeHomeDir } from "./utils.js";
 
@@ -240,6 +241,7 @@ export interface Messages {
   slashErrSwitchFailed: (model: string) => string;
   slashErrArg: (cmd: string) => string;
   slashErrUnknown: (cmd: string) => string;
+  slashErrModeArg: (mode: string) => string;
   slashErrFailed: (cmd: string, msg: string) => string;
 }
 
@@ -383,6 +385,7 @@ const zh: Messages = {
   slashErrSwitchFailed: (model) => `模型切换失败: ${model}`,
   slashErrArg: (cmd) => `/${cmd} 需要参数`,
   slashErrUnknown: (cmd) => `未知命令 /${cmd}`,
+  slashErrModeArg: (mode) => `不支持的模式 "${mode}"（可选 ${SESSION_MODES.join("|")}）`,
   slashErrFailed: (cmd, msg) => `${cmd} 失败: ${msg}`,
 };
 
@@ -538,6 +541,7 @@ const en: Messages = {
   slashErrSwitchFailed: (model) => `model switch failed for ${model}`,
   slashErrArg: (cmd) => `/${cmd} requires an argument`,
   slashErrUnknown: (cmd) => `unknown /${cmd}`,
+  slashErrModeArg: (mode) => `unsupported mode "${mode}" (expected ${SESSION_MODES.join("|")})`,
   slashErrFailed: (cmd, msg) => `${cmd} failed: ${msg}`,
 };
 

@@ -26,6 +26,7 @@ import {
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { configProviderIdFor } from "./account-provider.js";
+import { SESSION_MODES } from "./session-modes.js";
 import { builtinProviderTablePath, listProviderTemplates } from "../settings/provider-config.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 
@@ -509,10 +510,9 @@ export async function buildModes(
   }
   return {
     currentModeId: currentMode,
-    // ZCode 3.3.0 mode enum: plan/build/edit/yolo/auto. settings.mode only
-    // carries `current` (no `available` list, unlike thoughtLevel), so the full
-    // enum is advertised here.
-    availableModes: ["plan", "build", "edit", "yolo", "auto"].map((m) => ({
+    // settings.mode only carries `current` (no `available` list, unlike
+    // thoughtLevel), so the bridge's own list is advertised here.
+    availableModes: SESSION_MODES.map((m) => ({
       id: m,
       name: capitalize(m),
     })),

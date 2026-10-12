@@ -120,6 +120,15 @@ describe("setMode param normalization", () => {
     });
   });
 
+  it("the reserved/unimplemented auto mode is rejected before the backend", async () => {
+    const { server, backend } = makeServer();
+    const { cx } = mockContext();
+    await expect(setMode(server, { sessionId: "sess_acp", modeId: "auto" }, cx)).rejects.toThrow(
+      /unsupported mode "auto"/,
+    );
+    expect(backend.calls.some((c) => c.method === "session/setMode")).toBe(false);
+  });
+
   it("missing both mode and modeId is rejected", async () => {
     const { server } = makeServer();
     const { cx } = mockContext();

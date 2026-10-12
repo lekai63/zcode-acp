@@ -23,6 +23,8 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
+import { isSessionMode } from "./session-modes.js";
+
 // Local copy of utils.warn: importing it here would close a cycle once
 // utils.isDebug reads the merged debug flag (utils → settings → user-config
 // → utils). ESLint has no no-cycle rule — the graph stays acyclic by hand.
@@ -148,9 +150,6 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** The session modes the backend's own mode select offers (mirrors CONFIG_META). */
-const SESSION_MODES = new Set(["plan", "build", "edit", "yolo", "auto"]);
-
 /** Normalized language pick: "zh*"/"en*" prefixes accepted, else undefined. */
 function parseLang(v: unknown): "zh" | "en" | undefined {
   if (typeof v !== "string") return undefined;
@@ -245,7 +244,7 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
     const mode = body["mode"];
     if (mode !== undefined) {
       const m = typeof mode === "string" ? mode.trim() : "";
-      if (m && SESSION_MODES.has(m)) s.mode = m;
+      if (isSessionMode(m)) s.mode = m;
       else warn(`config: ${label}.mode=${JSON.stringify(mode)} is not a session mode — ignoring`);
     }
     return s;

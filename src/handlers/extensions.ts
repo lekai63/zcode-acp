@@ -27,6 +27,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 import { emitInitialUsage } from "../config/model-cache.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
 import { emitConfigOptionUpdate, rememberModelChoice } from "../config/options.js";
+import { isSessionMode, SESSION_MODES } from "../config/session-modes.js";
 import { ProjectionDiffer } from "../translators/projection-differ.js";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
@@ -319,6 +320,9 @@ export async function setMode(
   // -32601 when it wasn't routed, so both normalize here.
   const mode = params.mode ?? params.modeId;
   if (!mode) throw new Error("setMode requires mode");
+  if (!isSessionMode(mode)) {
+    throw new Error(`setMode: unsupported mode "${mode}" (expected ${SESSION_MODES.join("|")})`);
+  }
   const resp = await (
     await server.ensureBackend()
   ).request(server.nextId(), "session/setMode", { sessionId: zcodeSid, mode }, 15000);

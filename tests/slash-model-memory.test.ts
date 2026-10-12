@@ -134,4 +134,17 @@ describe("slash switches remember the model choice", () => {
     expect(server.sessionModelChoices.has("zc-mem-4")).toBe(false);
     expect(lookupLazySession(acpSid)?.modelChoice).toBeUndefined();
   });
+
+  it("/mode auto is rejected without reaching the backend (auto is unimplemented)", async () => {
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+    const acpSid = seedSession(server, "zc-mem-5");
+    const { cx } = recordingCx();
+
+    await expect(handleSlashCommand(server, cx, acpSid, "zc-mem-5", "/mode auto")).rejects.toThrow(
+      /auto/,
+    );
+    expect(calls).not.toContain("session/setMode");
+  });
 });
