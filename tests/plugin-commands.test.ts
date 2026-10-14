@@ -28,13 +28,15 @@ vi.mock("node:fs", async () => {
   const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
   return {
     ...actual,
-    existsSync: (p: string) => mockDirs.has(p) || mockFiles.has(p) || actual.existsSync(p),
+    // Fully isolated (unlike the delegation style): default-enabled official
+    // plugins make discovery scan the REAL cache whenever the fixtures don't
+    // cover a path, so any real-machine state must stay invisible here.
+    existsSync: (p: string) => mockDirs.has(p) || mockFiles.has(p),
     readFileSync: (p: string) => {
       if (mockFiles.has(p)) return mockFiles.get(p)!;
       return actual.readFileSync(p);
     },
     readdirSync: (p: string) => {
-      // Return mock entries if any exist in the mock store; otherwise delegate.
       const entries: string[] = [];
       const prefix = p + "/";
       for (const key of mockDirs) {
@@ -49,7 +51,7 @@ vi.mock("node:fs", async () => {
           if (!rest.includes("/")) entries.push(rest);
         }
       }
-      return entries.length > 0 ? entries : actual.readdirSync(p);
+      return entries;
     },
     statSync: (p: string) => {
       if (mockDirs.has(p)) return { isDirectory: () => true } as ReturnType<typeof actual.statSync>;
@@ -137,6 +139,29 @@ describe("loadPluginCommands", () => {
     expect(commands[0]!.name).toBe("code-review");
     expect(commands[0]!.description).toBe("Code review a pull request");
     expect(commands[0]!.input).toEqual({ hint: "[pr number or url]" });
+  });
+
+  it("loads commands from default-enabled official plugins without any config entry", () => {
+    resetMocks();
+
+    const home = homedir();
+    const cacheDir = `${home}/.zcode/cli/plugins/cache`;
+
+    // No config.json: the official cache still yields default-on plugins
+    // (zcode-guide ships the /workflow command).
+    mockDirs.add(cacheDir);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/zcode-guide`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/zcode-guide/0.2.0`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/zcode-guide/0.2.0/commands`);
+    mockFiles.set(
+      `${cacheDir}/zcode-plugins-official/zcode-guide/0.2.0/commands/workflow.md`,
+      `---\ndescription: Run a dynamic workflow\n---\n\nWorkflow.`,
+    );
+
+    const commands = loadPluginCommands();
+    expect(commands).toHaveLength(1);
+    expect(commands[0]!.name).toBe("workflow");
   });
 
   it("skips disabled plugins", () => {

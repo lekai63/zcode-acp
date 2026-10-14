@@ -139,13 +139,10 @@ async function workflowFlag(
  * idempotent and correctly ordered (a late settle supersedes the stale send).
  */
 export function resendMenuAfterGateSettled(server: ZcodeAcpServer, acpSid: string): void {
-  if (!server.allCommands || !workflowGateNow(server)?.enabled) return;
+  const commands = server.sessionCommands(acpSid);
+  if (!commands || !workflowGateNow(server)?.enabled) return;
   for (const sid of server.sessionAliases(acpSid)) {
-    sendAvailableCommandsDeferred(
-      server.clients,
-      sid,
-      filterWorkflowCommands(server, server.allCommands),
-    );
+    sendAvailableCommandsDeferred(server.clients, sid, filterWorkflowCommands(server, commands));
   }
 }
 

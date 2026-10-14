@@ -49,7 +49,7 @@ vi.mock("node:fs", async () => {
   };
 });
 
-import { loadSkillCommands } from "../src/config/skill-discovery.js";
+import { loadProjectSkillCommands, loadSkillCommands } from "../src/config/skill-discovery.js";
 
 function resetMocks(): void {
   mockFiles.clear();
@@ -229,7 +229,117 @@ describe("loadSkillCommands", () => {
     expect(skills).toHaveLength(0);
   });
 
-  it("skips SKILL.md without description", () => {
+  it("discovers skills from default-enabled official plugins without any config entry", () => {
+    resetMocks();
+    const cacheDir = `${HOME}/.zcode/cli/plugins/cache`;
+    // NO config.json — the runtime scans the official cache with default
+    // enablement, and so must the bridge (documents/pdf/zcode-guide/…).
+    mockDirs.add(cacheDir);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/pdf`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/pdf/0.1.7`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/pdf/0.1.7/skills`);
+    setSkill(`${cacheDir}/zcode-plugins-official/pdf/0.1.7/skills`, "pdf", "PDF toolkit.");
+
+    const skills = loadSkillCommands();
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.name).toBe("$pdf");
+  });
+
+  it("keeps default-enabled official plugins off when explicitly disabled in config", () => {
+    resetMocks();
+    const cacheDir = `${HOME}/.zcode/cli/plugins/cache`;
+    mockFiles.set(
+      `${HOME}/.zcode/cli/config.json`,
+      JSON.stringify({
+        plugins: { enabledPlugins: { "pdf@zcode-plugins-official": false } },
+      }),
+    );
+    mockDirs.add(cacheDir);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/pdf`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/pdf/0.1.7`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/pdf/0.1.7/skills`);
+    setSkill(`${cacheDir}/zcode-plugins-official/pdf/0.1.7/skills`, "pdf", "PDF toolkit.");
+
+    expect(loadSkillCommands()).toHaveLength(0);
+  });
+
+  it("skips non-default official plugins unless explicitly enabled", () => {
+    resetMocks();
+    const cacheDir = `${HOME}/.zcode/cli/plugins/cache`;
+    mockDirs.add(cacheDir);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/android-emulator`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/android-emulator/0.1.0`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/android-emulator/0.1.0/skills`);
+    setSkill(
+      `${cacheDir}/zcode-plugins-official/android-emulator/0.1.0/skills`,
+      "android",
+      "Android automation.",
+    );
+
+    // Default-off without config…
+    expect(loadSkillCommands()).toHaveLength(0);
+
+    // …and on with an explicit true.
+    mockFiles.set(
+      `${HOME}/.zcode/cli/config.json`,
+      JSON.stringify({
+        plugins: { enabledPlugins: { "android-emulator@zcode-plugins-official": true } },
+      }),
+    );
+    const skills = loadSkillCommands();
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.name).toBe("$android");
+  });
+
+  it("skips suppressed built-ins (uninstalled from the desktop)", () => {
+    resetMocks();
+    const cacheDir = `${HOME}/.zcode/cli/plugins/cache`;
+    mockFiles.set(
+      `${HOME}/.zcode/cli/config.json`,
+      JSON.stringify({
+        plugins: { suppressedBuiltins: ["zcode-guide@zcode-plugins-official"] },
+      }),
+    );
+    mockDirs.add(cacheDir);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/zcode-guide`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/zcode-guide/0.2.0`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/zcode-guide/0.2.0/skills`);
+    setSkill(
+      `${cacheDir}/zcode-plugins-official/zcode-guide/0.2.0/skills`,
+      "diagnosing-skills",
+      "Diagnose skills.",
+    );
+
+    expect(loadSkillCommands()).toHaveLength(0);
+  });
+
+  it("honors the global plugins.enabled=false kill switch (plugin skills only)", () => {
+    resetMocks();
+    const cacheDir = `${HOME}/.zcode/cli/plugins/cache`;
+    mockFiles.set(
+      `${HOME}/.zcode/cli/config.json`,
+      JSON.stringify({ plugins: { enabled: false } }),
+    );
+    mockDirs.add(cacheDir);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/pdf`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/pdf/0.1.7`);
+    mockDirs.add(`${cacheDir}/zcode-plugins-official/pdf/0.1.7/skills`);
+    setSkill(`${cacheDir}/zcode-plugins-official/pdf/0.1.7/skills`, "pdf", "PDF toolkit.");
+    setSkill(`${HOME}/.zcode/skills`, "user-skill", "A user skill.");
+
+    // Plugin roots die with the switch; user-scope skills survive (the
+    // runtime only gates resolvePluginSkillRootDescriptors).
+    const skills = loadSkillCommands();
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.name).toBe("$user-skill");
+  });
+
+  it("keeps SKILL.md without description (ZCode lists it with an empty one)", () => {
     resetMocks();
     mockDirs.add(`${HOME}/.zcode/skills`);
     mockDirs.add(`${HOME}/.zcode/skills/no-desc`);
@@ -238,7 +348,9 @@ describe("loadSkillCommands", () => {
       `---\nname: no-desc\n---\n\nNo description field.`,
     );
     const skills = loadSkillCommands();
-    expect(skills).toHaveLength(0);
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.name).toBe("$no-desc");
+    expect(skills[0]!.description).toBe("");
   });
 
   it("uses directory name when frontmatter has no name field", () => {
@@ -292,5 +404,35 @@ describe("loadSkillCommands", () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+});
+
+describe("loadProjectSkillCommands", () => {
+  it("scans both <cwd>/.zcode/skills and <cwd>/.agents/skills", () => {
+    resetMocks();
+    const project = "/srv/proj";
+    setSkill(`${project}/.zcode/skills`, "deploy", "Deploy the project.");
+    setSkill(`${project}/.agents/skills`, "review", "Review code.");
+    const skills = loadProjectSkillCommands(project);
+    expect(skills).toHaveLength(2);
+    const names = skills.map((s) => s.name).sort();
+    expect(names).toEqual(["$deploy", "$review"]);
+  });
+
+  it("never touches the process startup cwd or user scope", () => {
+    resetMocks();
+    setSkill(`${HOME}/.zcode/skills`, "user-skill", "User scope.");
+    const skills = loadProjectSkillCommands("/srv/empty-proj");
+    expect(skills).toEqual([]);
+  });
+
+  it("deduplicates by name (.zcode wins over .agents)", () => {
+    resetMocks();
+    const project = "/srv/proj";
+    setSkill(`${project}/.zcode/skills`, "dup", "From .zcode.");
+    setSkill(`${project}/.agents/skills`, "dup", "From .agents.");
+    const skills = loadProjectSkillCommands(project);
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.description).toBe("From .zcode.");
   });
 });

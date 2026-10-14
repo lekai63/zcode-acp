@@ -19,6 +19,7 @@ import {
   ZcodeBackend,
 } from "./backend/index.js";
 import { armSandboxArgv, collectSandboxWorkspaces, sandboxActive } from "./backend/sandbox.js";
+import { loadProjectSkillCommands } from "./config/skill-discovery.js";
 import {
   captureGate,
   pushDynamicWorkflowPolicy,
@@ -283,6 +284,17 @@ export class ZcodeAcpServer {
    * gate has settled.
    */
   allCommands: Array<{ name: string; description: string; input?: { hint: string } }> | null = null;
+  /**
+   * Per-cwd advertised-command cache: `allCommands` merged with the session
+   * cwd's project-scope skills (`.zcode/skills` + `.agents/skills`). The
+   * bridge process may be spawned with an unrelated cwd (paseo daemon
+   * inherits its service cwd), so project skills resolve per SESSION, not at
+   * startup — see sessionCommands().
+   */
+  private readonly commandsByCwd = new Map<
+    string,
+    Array<{ name: string; description: string; input?: { hint: string } }>
+  >();
   /**
    * Sandbox dynamic-allow state (ADR-0011): realpaths granted for this
    * bridge lifetime ("仅此一次" answers) — folded into the Seatbelt profile
@@ -981,6 +993,37 @@ export class ZcodeAcpServer {
       if (zsid === zcodeSid) aliases.push(sid);
     }
     return aliases.length > 0 ? aliases : [acpSid];
+  }
+
+  /**
+   * The advertised command list for a session: `allCommands` plus the
+   * session cwd's project-scope skills (`.zcode/skills` + `.agents/skills`,
+   * via loadProjectSkillCommands). Falls back to the base list when the base
+   * hasn't been built yet or the session has no recorded cwd. Merged per cwd
+   * (memoized): project skills don't change mid-session — same freshness as
+   * the startup-built base list. Base names win on clash.
+   */
+  sessionCommands(
+    acpSid: string,
+  ): Array<{ name: string; description: string; input?: { hint: string } }> | null {
+    if (!this.allCommands) return null;
+    const cwd = this.sessionCwds.get(acpSid);
+    if (!cwd) return this.allCommands;
+    let merged = this.commandsByCwd.get(cwd);
+    if (!merged) {
+      const extra = loadProjectSkillCommands(cwd);
+      if (extra.length === 0) {
+        merged = this.allCommands;
+      } else {
+        const seen = new Set(this.allCommands.map((c) => c.name));
+        merged = [
+          ...this.allCommands,
+          ...extra.filter((c) => !seen.has(c.name)),
+        ];
+      }
+      this.commandsByCwd.set(cwd, merged);
+    }
+    return merged;
   }
 
   /**
