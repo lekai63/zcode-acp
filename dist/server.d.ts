@@ -270,6 +270,14 @@ export declare class ZcodeAcpServer {
         };
     }> | null;
     /**
+     * Per-cwd advertised-command cache: `allCommands` merged with the session
+     * cwd's project-scope skills (`.zcode/skills` + `.agents/skills`). The
+     * bridge process may be spawned with an unrelated cwd (paseo daemon
+     * inherits its service cwd), so project skills resolve per SESSION, not at
+     * startup — see sessionCommands().
+     */
+    private readonly commandsByCwd;
+    /**
      * Sandbox dynamic-allow state (ADR-0011): realpaths granted for this
      * bridge lifetime ("仅此一次" answers) — folded into the Seatbelt profile
      * on the next backend respawn in ensureBackend().
@@ -683,6 +691,21 @@ export declare class ZcodeAcpServer {
      * pathological, accepted.
      */
     sessionAliases(acpSid: string): string[];
+    /**
+     * The advertised command list for a session: `allCommands` plus the
+     * session cwd's project-scope skills (`.zcode/skills` + `.agents/skills`,
+     * via loadProjectSkillCommands). Falls back to the base list when the base
+     * hasn't been built yet or the session has no recorded cwd. Merged per cwd
+     * (memoized): project skills don't change mid-session — same freshness as
+     * the startup-built base list. Base names win on clash.
+     */
+    sessionCommands(acpSid: string): Array<{
+        name: string;
+        description: string;
+        input?: {
+            hint: string;
+        };
+    }> | null;
     /**
      * Push a `session/update` notification to the client from OUTSIDE a request
      * handler (used by the background-task listener). Resolves the acp_sid from

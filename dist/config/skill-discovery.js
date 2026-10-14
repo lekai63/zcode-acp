@@ -11,8 +11,13 @@
  * Discovery sources (in priority order — first occurrence wins on name clash):
  *   1. <zcode-home>/skills/&#42;/SKILL.md      (user scope, ZCode native)
  *   2. ~/.agents/skills/&#42;/SKILL.md          (user scope, shared agents)
- *   3. enabled plugin <cache>/skills/&#42;/SKILL.md
- *   4. <cwd>/.agents/skills/&#42;/SKILL.md      (project scope)
+ *   3. enabled plugin <cache>/skills/&#42;/SKILL.md (default-on official
+ *      plugins included — see plugin-enablement.ts)
+ *
+ * Project-scope skills live in their own loader (`loadProjectSkillCommands`)
+ * because the bridge process may be spawned with an unrelated cwd (the paseo
+ * daemon inherits its service cwd): they are resolved per SESSION cwd and
+ * merged into the advertised list at advertise time, not at process startup.
  *
  * `<zcode-home>` is the ZCode data root (`~/.zcode`, or `$ZCODE_HOME` when
  * set — see `zcodeHomeDir()`). Skills explicitly disabled in
@@ -22,8 +27,8 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import process from "node:process";
-import { compareVersions, log, zcodeCliConfigPath, zcodeHomeDir, zcodePluginCacheDir, } from "../utils.js";
+import { loadEnabledPluginRoots } from "./plugin-enablement.js";
+import { log, zcodeCliConfigPath, zcodeHomeDir } from "../utils.js";
 /** Max description length before truncation with ellipsis. */
 const MAX_DESC_LEN = 80;
 /**
@@ -97,9 +102,9 @@ function scanSkillDir(dir, disabledPaths, results, seen) {
         const content = readFileSync(skillMd, "utf8");
         const fm = parseFrontmatter(content);
         const name = fm["name"] ?? entry;
+        // Skills without a description stay listed (ZCode surfaces them with an
+        // empty description; dropping them hid e.g. cnb-skills-2).
         const description = fm["description"] ?? "";
-        if (!description)
-            continue;
         // Skip explicitly non-user-invocable skills.
         if (fm["user-invocable"] === "false")
             continue;
@@ -148,39 +153,37 @@ export function loadSkillCommands() {
     scanSkillDir(path.join(zcodeHomeDir(), "skills"), disabledPaths, results, seen);
     // 2. ~/.agents/skills/
     scanSkillDir(path.join(homedir(), ".agents", "skills"), disabledPaths, results, seen);
-    // 3. Enabled plugin skills.
-    const enabledPlugins = config?.plugins?.enabledPlugins ?? {};
-    for (const [pluginKey, enabledFlag] of Object.entries(enabledPlugins)) {
-        if (!enabledFlag)
-            continue;
-        const atIdx = pluginKey.indexOf("@");
-        if (atIdx <= 0)
-            continue;
-        const pluginName = pluginKey.slice(0, atIdx);
-        const marketplace = pluginKey.slice(atIdx + 1);
-        const pluginDir = path.join(zcodePluginCacheDir(), marketplace, pluginName);
-        if (!existsSync(pluginDir))
-            continue;
-        // Find the latest version directory.
-        let latestVersion = "";
-        try {
-            for (const entry of readdirSync(pluginDir)) {
-                const vDir = path.join(pluginDir, entry);
-                if (statSync(vDir).isDirectory() && compareVersions(entry, latestVersion) > 0) {
-                    latestVersion = entry;
-                }
-            }
-        }
-        catch {
-            continue;
-        }
-        if (!latestVersion)
-            continue;
-        scanSkillDir(path.join(pluginDir, latestVersion, "skills"), disabledPaths, results, seen);
+    // 3. Enabled plugin skills (default-on official plugins included —
+    // plugin-enablement.ts replicates the runtime's enablement rule).
+    for (const plugin of loadEnabledPluginRoots()) {
+        scanSkillDir(path.join(plugin.dir, "skills"), disabledPaths, results, seen);
     }
-    // 4. Project-level .agents/skills/ (if exists).
-    scanSkillDir(path.join(process.cwd(), ".agents", "skills"), disabledPaths, results, seen);
     log(`skill-discovery: loaded ${results.length} skill(s)`);
+    return results;
+}
+/**
+ * Project-scope skills for a session cwd: BOTH spellings ZCode scans
+ * (workspace `.zcode/skills` and the shared-agents `.agents/skills`).
+ * Called per session at advertise time — see the module docblock.
+ */
+export function loadProjectSkillCommands(cwd) {
+    const results = [];
+    const seen = new Set();
+    let config = null;
+    try {
+        const cliConfigPath = zcodeCliConfigPath();
+        if (existsSync(cliConfigPath)) {
+            config = JSON.parse(readFileSync(cliConfigPath, "utf8"));
+        }
+    }
+    catch {
+        // best-effort — project skills without a disable list
+    }
+    const disabledPaths = loadDisabledSkillPaths(config);
+    scanSkillDir(path.join(cwd, ".zcode", "skills"), disabledPaths, results, seen);
+    scanSkillDir(path.join(cwd, ".agents", "skills"), disabledPaths, results, seen);
+    if (results.length > 0)
+        log(`skill-discovery: ${results.length} project skill(s) for ${cwd}`);
     return results;
 }
 //# sourceMappingURL=skill-discovery.js.map

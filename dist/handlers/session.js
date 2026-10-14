@@ -73,10 +73,11 @@ async function workflowFlag(server) {
  * idempotent and correctly ordered (a late settle supersedes the stale send).
  */
 export function resendMenuAfterGateSettled(server, acpSid) {
-    if (!server.allCommands || !workflowGateNow(server)?.enabled)
+    const commands = server.sessionCommands(acpSid);
+    if (!commands || !workflowGateNow(server)?.enabled)
         return;
     for (const sid of server.sessionAliases(acpSid)) {
-        sendAvailableCommandsDeferred(server.clients, sid, filterWorkflowCommands(server, server.allCommands));
+        sendAvailableCommandsDeferred(server.clients, sid, filterWorkflowCommands(server, commands));
     }
 }
 /**

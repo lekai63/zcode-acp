@@ -11,8 +11,13 @@
  * Discovery sources (in priority order — first occurrence wins on name clash):
  *   1. <zcode-home>/skills/&#42;/SKILL.md      (user scope, ZCode native)
  *   2. ~/.agents/skills/&#42;/SKILL.md          (user scope, shared agents)
- *   3. enabled plugin <cache>/skills/&#42;/SKILL.md
- *   4. <cwd>/.agents/skills/&#42;/SKILL.md      (project scope)
+ *   3. enabled plugin <cache>/skills/&#42;/SKILL.md (default-on official
+ *      plugins included — see plugin-enablement.ts)
+ *
+ * Project-scope skills live in their own loader (`loadProjectSkillCommands`)
+ * because the bridge process may be spawned with an unrelated cwd (the paseo
+ * daemon inherits its service cwd): they are resolved per SESSION cwd and
+ * merged into the advertised list at advertise time, not at process startup.
  *
  * `<zcode-home>` is the ZCode data root (`~/.zcode`, or `$ZCODE_HOME` when
  * set — see `zcodeHomeDir()`). Skills explicitly disabled in
@@ -34,4 +39,10 @@ export interface SkillEntry {
  * failures are logged and swallowed (returns whatever was found).
  */
 export declare function loadSkillCommands(): SkillEntry[];
+/**
+ * Project-scope skills for a session cwd: BOTH spellings ZCode scans
+ * (workspace `.zcode/skills` and the shared-agents `.agents/skills`).
+ * Called per session at advertise time — see the module docblock.
+ */
+export declare function loadProjectSkillCommands(cwd: string): SkillEntry[];
 //# sourceMappingURL=skill-discovery.d.ts.map

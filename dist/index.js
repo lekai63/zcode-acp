@@ -140,8 +140,9 @@ function buildAgentApp(server, allCommands) {
         .onRequest("initialize", (ctx) => server.initialize(ctx.params, ctx.client))
         .onRequest("session/new", async (ctx) => {
         const result = await newSession(server, ctx.params, ctx.client);
+        const commands = server.sessionCommands(result.sessionId) ?? allCommands;
         for (const sid of server.sessionAliases(result.sessionId)) {
-            sendAvailableCommandsDeferred(server.clients, sid, filterWorkflowCommands(server, allCommands));
+            sendAvailableCommandsDeferred(server.clients, sid, filterWorkflowCommands(server, commands));
         }
         return result;
     })
@@ -154,8 +155,9 @@ function buildAgentApp(server, allCommands) {
         // (editor + TUI + app sharing one bridge through the hub). Live turn
         // updates keep fanning out via prompt()'s broadcast cx.
         const result = await resumeSession(server, ctx.params, ctx.client);
+        const commands = server.sessionCommands(ctx.params.sessionId) ?? allCommands;
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
-            sendAvailableCommandsDeferred(server.clients, sid, filterWorkflowCommands(server, allCommands));
+            sendAvailableCommandsDeferred(server.clients, sid, filterWorkflowCommands(server, commands));
         }
         // A client that (re)connects catches up via resume/load; any interaction
         // request still waiting for an answer is re-sent to it so a question
@@ -166,8 +168,9 @@ function buildAgentApp(server, allCommands) {
         .onRequest("session/load", async (ctx) => {
         // Targeted replay — see the session/resume comment above.
         const result = await loadSession(server, ctx.params, ctx.client);
+        const commands = server.sessionCommands(ctx.params.sessionId) ?? allCommands;
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
-            sendAvailableCommandsDeferred(server.clients, sid, filterWorkflowCommands(server, allCommands));
+            sendAvailableCommandsDeferred(server.clients, sid, filterWorkflowCommands(server, commands));
         }
         resendPendingInteractions(server, ctx.client, ctx.params.sessionId);
         return result;
